@@ -1,0 +1,12 @@
+{
+  "device": "cpu",
+  "epochs_run": 20,
+  "final_train_loss": 0.006224043923430145,
+  "final_val_loss": 0.01587039449562629,
+  "artifact": {
+    "model": "AAPL_lstm.pt",
+    "scaler": "AAPL_scaler.pkl",
+    "metrics": "AAPL_metrics.json"
+  },
+  "updated": "2026-03-05T08:36:52.658563"
+}

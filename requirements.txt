@@ -1,0 +1,30 @@
+# ViziGenesis — Dependencies
+# Python 3.9+
+
+# Web framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+websockets==12.0
+
+# Data & Finance
+yfinance==0.2.40
+financedatabase==2.3.0
+tvdatafeed==2.1.0
+pandas==2.2.2
+numpy==1.26.4
+
+# Machine Learning
+torch>=2.1.0
+scikit-learn==1.5.1
+joblib==1.4.2
+
+# V2 — Tree models (optional but recommended)
+lightgbm>=4.1.0
+xgboost>=2.0.0
+
+# V2 — FRED macro data (optional — falls back to Yahoo proxy)
+# fredapi>=0.5.1
+
+# Utilities
+aiofiles==24.1.0
+python-multipart==0.0.9

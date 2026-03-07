@@ -1,0 +1,16 @@
+{
+  "trained_via": "predict_auto_train",
+  "epochs_run": 50,
+  "final_train_loss": 0.002142473166300492,
+  "final_val_loss": 0.003298199075895051,
+  "device": "cpu",
+  "seq_len": 60,
+  "features": [
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Volume"
+  ],
+  "updated": "2026-03-05T10:20:54.611057"
+}

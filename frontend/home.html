@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ViziGenesis — Dự đoán cổ phiếu bằng AI</title>
+
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+
+    <!-- Plotly -->
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="https://s3.tradingview.com/tv.js"></script>
+
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css" referrerpolicy="no-referrer" />
+
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="static/css/style.css">
+</head>
+<body>
+
+<!-- ═══ Navbar ═══════════════════════════════════════════════════════ -->
+<header class="navbar">
+    <div class="logo"><i class="fa-solid fa-bolt"></i> ViziGenesis</div>
+    <div class="nav-right">
+        <nav>
+            <a href="/" data-route="home" class="active">Tổng quan</a>
+            <a href="/predict" data-route="predict">Dự đoán &amp; Huấn luyện</a>
+        </nav>
+        <button id="theme-toggle" class="theme-toggle" title="Chuyển giao diện" aria-label="Chuyển giao diện">
+            <i class="fa-solid fa-moon"></i>
+        </button>
+    </div>
+</header>
+
+
+<!-- ═══ Hero / Search ═══════════════════════════════════════════════ -->
+<main class="home-page">
+<section class="hero">
+    <div class="hero-kicker">
+        <span class="hero-dot"></span>
+        <span>AI STOCK INTELLIGENCE PLATFORM</span>
+    </div>
+    <h1>Nền tảng AI phân tích cổ phiếu</h1>
+    <p>Giá thời gian thực, biểu đồ lớn, AI phân tích xu hướng và tin tức liên quan trên cùng một dashboard full màn hình.</p>
+    <div class="search-box">
+        <input id="sym-input" type="text" placeholder="Nhập mã cổ phiếu" 
+               autofocus autocomplete="off" spellcheck="false" list="symbol-suggest">
+        <button class="btn btn-primary" id="btn-go" onclick="handleSearch()"><i class="fa-solid fa-magnifying-glass"></i> Phân tích</button>
+    </div>
+    <datalist id="symbol-suggest"></datalist>
+    <div class="hero-suggest mt-1">
+        <span class="hero-suggest-label">Mã phổ biến:</span>
+        <button type="button" class="hero-suggest-chip" onclick="document.getElementById('sym-input').value='VIC.VN';handleSearch()">VIC.VN</button>
+        <button type="button" class="hero-suggest-chip" onclick="document.getElementById('sym-input').value='VNM.VN';handleSearch()">VNM.VN</button>
+        <button type="button" class="hero-suggest-chip" onclick="document.getElementById('sym-input').value='AAPL';handleSearch()">AAPL</button>
+        <button type="button" class="hero-suggest-chip" onclick="document.getElementById('sym-input').value='MSFT';handleSearch()">MSFT</button>
+        <button type="button" class="hero-suggest-chip" onclick="document.getElementById('sym-input').value='TSLA';handleSearch()">TSLA</button>
+        <button type="button" class="hero-suggest-chip" onclick="document.getElementById('sym-input').value='NVDA';handleSearch()">NVDA</button>
+    </div>
+</section>
+
+<!-- ═══ Dashboard (hidden until symbol entered) ════════════════════ -->
+<section class="market-shell dashboard-section hidden fade-in">
+    <div class="market-topbar">
+        <div>
+            <div class="market-symbol" id="hero-symbol">—</div>
+            <div class="market-subtitle">Bảng điều khiển phân tích thời gian thực</div>
+        </div>
+        <div class="market-actions">
+            <button class="btn btn-outline btn-sm" onclick="downloadCsv(currentSymbol)"><i class="fa-solid fa-file-csv"></i> Tải CSV</button>
+            <a href="/predict" data-route="predict" class="btn btn-primary btn-sm"><i class="fa-solid fa-gears"></i> Huấn luyện nâng cao</a>
+        </div>
+    </div>
+
+    <div class="market-grid">
+        <div class="market-main">
+            <section class="market-chart-area">
+                <div class="panel-title-row">
+                    <h2><i class="fa-solid fa-chart-candlestick"></i> Biểu đồ chính</h2>
+                    <div class="mini-badge">TradingView</div>
+                </div>
+                <div class="chart-stage chart-main" id="chart-candle"></div>
+            </section>
+
+            <section class="market-chart-area mt-2">
+                <h2><i class="fa-solid fa-chart-area"></i> Dự báo giá 30 ngày</h2>
+                <div class="chart-stage chart-lt" id="chart-lt"></div>
+            </section>
+        </div>
+
+        <aside class="market-side">
+            <section class="side-panel watchlist-panel">
+                <h2><i class="fa-solid fa-table-list"></i> Watchlist thị trường</h2>
+                <div id="watchlist-panel">
+                    <p class="text-muted">Đang tải watchlist…</p>
+                </div>
+            </section>
+
+            <section class="side-panel">
+                <h2><i class="fa-solid fa-chart-line"></i> Giá trực tiếp</h2>
+                <div id="price-display">
+                    <p class="text-muted text-center">Nhập mã cổ phiếu ở trên</p>
+                </div>
+            </section>
+
+            <section class="side-panel">
+                <h2><i class="fa-solid fa-robot"></i> Phân tích AI</h2>
+                <div id="prediction-display">
+                    <p class="text-muted text-center">Kết quả dự đoán sẽ hiển thị tại đây</p>
+                </div>
+            </section>
+
+            <section class="side-panel">
+                <h2><i class="fa-solid fa-lightbulb"></i> Kết luận nhanh</h2>
+                <div id="insight-display">
+                    <p class="text-muted">Chưa có dữ liệu để kết luận.</p>
+                </div>
+            </section>
+        </aside>
+    </div>
+
+    <div class="market-bottom-grid mt-2">
+        <section class="news-stream">
+            <h2><i class="fa-solid fa-newspaper"></i> Tin tức liên quan</h2>
+            <div id="news-feed">
+                <p class="text-muted">Tin tức theo mã cổ phiếu sẽ hiển thị tại đây.</p>
+            </div>
+        </section>
+    </div>
+</section>
+</main>
+
+<!-- Toast -->
+<div id="toast" class="toast"></div>
+
+<!-- Scripts -->
+<script src="static/js/app.js"></script>
+<script>
+    initThemeToggle();
+    let currentSymbol = "";
+    let currentPeriod = "1y";
+
+    function handleSearch() {
+        const sym = document.getElementById("sym-input").value.trim().toUpperCase();
+        if (!sym) return showToast("Vui lòng nhập mã cổ phiếu");
+        currentSymbol = sym;
+        localStorage.setItem("vizigenesis-last-symbol", sym);
+        location.hash = sym;
+        loadDashboard(sym);
+    }
+
+    // Enter key support
+    document.getElementById("sym-input").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") handleSearch();
+    });
+
+    // Load from URL hash or last symbol
+    const hashSym = (location.hash || "").replace("#", "").trim().toUpperCase();
+    const savedSym = (localStorage.getItem("vizigenesis-last-symbol") || "").trim().toUpperCase();
+    const bootstrapSym = hashSym || savedSym;
+    if (bootstrapSym) {
+        currentSymbol = bootstrapSym;
+        document.getElementById("sym-input").value = bootstrapSym;
+        if (!location.hash) location.hash = bootstrapSym;
+        loadDashboard(bootstrapSym);
+    }
+</script>
+</body>
+</html>

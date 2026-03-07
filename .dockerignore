@@ -1,0 +1,42 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Trained models (keep structure, ignore weights)
+models/**/*.pt
+models/**/*.pkl
+!models/.gitkeep
+
+# Data files
+data/*.csv
+!data/generate_sample.py
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# Docker
+.dockerignore
+
+# Misc
+*.log
+*.egg-info/
+dist/
+build/

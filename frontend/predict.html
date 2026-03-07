@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ViziGenesis — Dự đoán &amp; Huấn luyện</title>
+
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+
+    <!-- Plotly -->
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css" referrerpolicy="no-referrer" />
+
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="static/css/style.css">
+</head>
+<body>
+
+<!-- ═══ Navbar ═══════════════════════════════════════════════════════ -->
+<header class="navbar">
+    <div class="logo"><i class="fa-solid fa-bolt"></i> ViziGenesis</div>
+    <div class="nav-right">
+        <nav>
+            <a href="/" data-route="home">Tổng quan</a>
+            <a href="/predict" data-route="predict" class="active">Dự đoán &amp; Huấn luyện</a>
+        </nav>
+        <button id="theme-toggle" class="theme-toggle" title="Chuyển giao diện" aria-label="Chuyển giao diện">
+            <i class="fa-solid fa-moon"></i>
+        </button>
+    </div>
+</header>
+
+<main class="predict-page">
+    <h1 style="font-size:1.6rem;font-weight:800;margin-bottom:1.5rem">
+        <i class="fa-solid fa-screwdriver-wrench"></i> Huấn luyện mô hình &amp; tạo dự đoán
+    </h1>
+
+    <!-- ── Controls ─────────────────────────────────────────────────── -->
+    <section class="predict-strip mb-2">
+        <div class="grid-2" style="align-items:end;gap:1rem">
+            <div>
+                <label id="sym-label" style="font-size:.85rem;color:var(--text-muted)">Mã cổ phiếu</label>
+                <input id="sym-input" type="text" placeholder="VD: AAPL"
+                       list="symbol-suggest"
+                       style="width:100%;margin-top:.3rem;padding:.7rem 1rem;background:var(--bg-secondary);
+                              color:var(--text-primary);border:1px solid var(--border);border-radius:10px;
+                              font-size:1rem;outline:none">
+                <datalist id="symbol-suggest"></datalist>
+            </div>
+            <div>
+                <label style="font-size:.85rem;color:var(--text-muted)">Số epoch</label>
+                <input id="epoch-input" type="number" value="80" min="1" max="600"
+                       style="width:100%;margin-top:.3rem;padding:.7rem 1rem;background:var(--bg-secondary);
+                              color:var(--text-primary);border:1px solid var(--border);border-radius:10px;
+                              font-size:1rem;outline:none">
+            </div>
+        </div>
+        <div class="grid-2" style="align-items:end;gap:1rem;margin-top:.8rem">
+            <div>
+                <label style="font-size:.85rem;color:var(--text-muted)">Chế độ AI</label>
+                <select id="mode-input"
+                        style="width:100%;margin-top:.3rem;padding:.7rem 1rem;background:var(--bg-secondary);
+                               color:var(--text-primary);border:1px solid var(--border);border-radius:10px;
+                               font-size:1rem;outline:none">
+                    <option value="simple">Simple (nhanh, nhẹ)</option>
+                    <option value="pro">Professional (nhiều dữ liệu + chỉ báo kỹ thuật)</option>
+                    <option value="quant">Quant (TFT+BiLSTM+GRU — institutional grade)</option>
+                    <option value="v2">V2 Panel (multi-stock regime-aware — hedge-fund grade)</option>
+                </select>
+            </div>
+            <div class="text-muted" id="mode-hint" style="font-size:.85rem">
+                Simple: period 2y, epoch mặc định 80.
+            </div>
+        </div>
+        <div style="margin-top:1rem;display:flex;gap:.75rem;flex-wrap:wrap">
+            <button class="btn btn-primary" id="btn-train" onclick="startTraining()"><i class="fa-solid fa-rocket"></i> Huấn luyện</button>
+            <button class="btn btn-outline" id="btn-predict" onclick="runPredict()"><i class="fa-solid fa-robot"></i> Dự đoán</button>
+            <button class="btn btn-outline" id="btn-csv" onclick="dlCsv()"><i class="fa-solid fa-file-arrow-down"></i> Tải CSV</button>
+        </div>
+        <div id="model-status" class="text-muted mt-1" style="font-size:.85rem"></div>
+    </section>
+
+    <!-- ── Training progress ────────────────────────────────────────── -->
+    <section class="predict-strip predict-section hidden mb-2 fade-in" id="training-card">
+        <h2><i class="fa-solid fa-chart-line"></i> Tiến trình huấn luyện</h2>
+        <div id="train-progress" class="text-muted">Đang chờ…</div>
+        <div class="progress-bar mt-1"><div class="fill" id="train-fill" style="width:0%"></div></div>
+        <div class="chart-stage mt-2" id="chart-train"></div>
+    </section>
+
+    <!-- ── Prediction result ────────────────────────────────────────── -->
+    <section class="predict-strip predict-section hidden mb-2 fade-in">
+        <h2><i class="fa-solid fa-brain"></i> Kết quả dự đoán</h2>
+        <div id="predict-result">
+            <div id="prediction-display"></div>
+        </div>
+    </section>
+
+    <!-- ── Long-term forecast chart ─────────────────────────────────── -->
+    <section class="predict-strip predict-section hidden fade-in">
+        <h2><i class="fa-solid fa-chart-area"></i> Dự báo 30 ngày</h2>
+        <div class="chart-stage" id="chart-lt"></div>
+    </section>
+
+    <!-- ── Quant prediction results ─────────────────────────────────── -->
+    <section class="predict-strip predict-section hidden mb-2 fade-in" id="quant-result-card">
+        <h2><i class="fa-solid fa-building-columns"></i> Quant Analysis</h2>
+        <div id="quant-result-display"></div>
+    </section>
+
+    <!-- ── Quant feature importance ──────────────────────────────────── -->
+    <section class="predict-strip predict-section hidden fade-in" id="quant-feat-card">
+        <h2><i class="fa-solid fa-ranking-star"></i> Feature Importance (TFT-VSN)</h2>
+        <div class="chart-stage" id="chart-feat-importance"></div>
+    </section>
+
+    <!-- ── Quant walk-forward metrics ────────────────────────────────── -->
+    <section class="predict-strip predict-section hidden fade-in" id="quant-metrics-card">
+        <h2><i class="fa-solid fa-chart-pie"></i> Walk-Forward Validation Metrics</h2>
+        <div id="quant-wf-metrics"></div>
+    </section>
+
+    <!-- ── V2 Panel prediction results ───────────────────────────────── -->
+    <section class="predict-strip predict-section hidden mb-2 fade-in" id="v2-result-card">
+        <h2><i class="fa-solid fa-layer-group"></i> V2 Panel Analysis</h2>
+        <div id="v2-result-display"></div>
+    </section>
+
+    <!-- ── V2 feature importance ──────────────────────────────────────── -->
+    <section class="predict-strip predict-section hidden fade-in" id="v2-feat-card">
+        <h2><i class="fa-solid fa-ranking-star"></i> Feature Importance (V2-VSN)</h2>
+        <div class="chart-stage" id="chart-v2-feat-importance"></div>
+    </section>
+
+    <!-- ── V2 regime info ─────────────────────────────────────────────── -->
+    <section class="predict-strip predict-section hidden fade-in" id="v2-regime-card">
+        <h2><i class="fa-solid fa-gauge-high"></i> Market Regime</h2>
+        <div id="v2-regime-display"></div>
+    </section>
+</main>
+
+<!-- Toast -->
+<div id="toast" class="toast"></div>
+
+<!-- Scripts -->
+<script src="static/js/app.js"></script>
+<script>
+    initThemeToggle();
+    let sym = "";
+    let trainHistory = [];
+
+    function getSymbol() {
+        sym = document.getElementById("sym-input").value.trim().toUpperCase();
+        if (!sym) { showToast("Vui lòng nhập mã cổ phiếu"); return null; }
+        return sym;
+    }
+
+    function getTickerListInput() {
+        const raw = (document.getElementById("sym-input")?.value || "").toUpperCase();
+        const list = raw.split(",").map(s => s.trim()).filter(Boolean);
+        return [...new Set(list)];
+    }
+
+    function getMode() {
+        const m = (document.getElementById("mode-input")?.value || "simple").toLowerCase();
+        if (m === "v2") return "v2";
+        if (m === "quant") return "quant";
+        return m === "pro" ? "pro" : "simple";
+    }
+
+    function applyModeDefaults() {
+        const mode = getMode();
+        const epochInput = document.getElementById("epoch-input");
+        const hint = document.getElementById("mode-hint");
+        const symInput = document.getElementById("sym-input");
+        const symLabel = document.getElementById("sym-label");
+        if (mode === "v2") {
+            if (epochInput) epochInput.value = "80";
+            if (symInput) symInput.placeholder = "VD: AAPL,MSFT,AMZN,TSLA,NVDA";
+            if (symLabel) symLabel.textContent = "Mã cổ phiếu (nhiều mã cho train V2)";
+            if (hint) hint.textContent = "V2 Panel: Multi-stock regime-aware model. TFT+BiLSTM+GRU + LightGBM/XGBoost, FRED macro, sentiment, meta-router. Hedge-fund grade.";
+        } else if (mode === "quant") {
+            if (epochInput) epochInput.value = "150";
+            if (symInput) symInput.placeholder = "VD: AAPL";
+            if (symLabel) symLabel.textContent = "Mã cổ phiếu";
+            if (hint) hint.textContent = "Quant: TFT+BiLSTM+GRU hybrid, walk-forward validation, calibrated probabilities, backtest engine.";
+        } else if (mode === "pro") {
+            if (epochInput && Number(epochInput.value) < 180) epochInput.value = "220";
+            if (symInput) symInput.placeholder = "VD: AAPL";
+            if (symLabel) symLabel.textContent = "Mã cổ phiếu";
+            if (hint) hint.textContent = "Professional: period 10y, epoch mặc định 220, dùng MA/EMA/RSI/MACD/Bollinger/OBV.";
+        } else {
+            if (epochInput && Number(epochInput.value) > 220) epochInput.value = "80";
+            if (symInput) symInput.placeholder = "VD: AAPL";
+            if (symLabel) symLabel.textContent = "Mã cổ phiếu";
+            if (hint) hint.textContent = "Simple: period 2y, epoch mặc định 80.";
+        }
+        localStorage.setItem("vizigenesis-ai-mode", mode);
+    }
+
+    // ── Train via WebSocket with live progress ────────────────────────
+    function startTraining() {
+        const mode = getMode();
+        const epochs = parseInt(document.getElementById("epoch-input").value) || 50;
+        trainHistory = [];
+
+        // V2 and Quant modes use different training endpoints
+        if (mode === "v2") {
+            const tickers = getTickerListInput();
+            startV2Training(tickers, epochs);
+            return;
+        }
+
+        const s = getSymbol();
+        if (!s) return;
+
+        if (mode === "quant") {
+            startQuantTraining(s, epochs);
+            return;
+        }
+
+        // Show training card
+        document.getElementById("training-card").classList.remove("hidden");
+        document.getElementById("train-progress").textContent = "Đang kết nối…";
+        document.getElementById("train-fill").style.width = "0%";
+        document.getElementById("btn-train").disabled = true;
+
+        trainModelWs(
+            s,
+            epochs,
+            // onProgress
+            (d) => {
+                trainHistory.push(d);
+                const pct = Math.round((d.epoch / epochs) * 100);
+                document.getElementById("train-fill").style.width = pct + "%";
+                document.getElementById("train-progress").innerHTML =
+                    `Epoch <b>${d.epoch}</b>/${epochs} &nbsp;—&nbsp; ` +
+                    `Train: <b>${d.train_loss.toFixed(6)}</b> &nbsp; Validation: <b>${d.val_loss.toFixed(6)}</b>`;
+                renderTrainingChart(trainHistory);
+            },
+            // onDone
+            (d) => {
+                document.getElementById("train-fill").style.width = "100%";
+                document.getElementById("train-progress").innerHTML =
+                    `<i class="fa-solid fa-circle-check text-green"></i> Hoàn tất (${mode.toUpperCase()}) — ${d.epochs_run} epoch`;
+                document.getElementById("btn-train").disabled = false;
+                showToast("Huấn luyện hoàn tất!");
+                renderTrainingChart(trainHistory);
+                // Refresh model status
+                checkStatus(s, mode);
+            },
+            mode,
+        );
+    }
+
+    // ── Quant Training via REST (walk-forward is too long for WS in many cases)
+    async function startQuantTraining(sym, epochs) {
+        document.getElementById("training-card").classList.remove("hidden");
+        document.getElementById("train-progress").innerHTML = "<i class='fa-solid fa-spinner fa-spin'></i> Đang huấn luyện Quant (walk-forward)… Quá trình có thể mất vài phút.";
+        document.getElementById("train-fill").style.width = "10%";
+        document.getElementById("btn-train").disabled = true;
+        try {
+            const res = await fetch(`${API}/api/quant/train/${sym}?period=10y&epochs=${epochs}`, { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || 'Training failed');
+            document.getElementById("train-fill").style.width = "100%";
+            const wfInfo = data.walk_forward || {};
+            const rawM = wfInfo.raw_metrics || {};
+            document.getElementById("train-progress").innerHTML =
+                `<i class='fa-solid fa-circle-check text-green'></i> Quant training complete — ` +
+                `${wfInfo.n_folds || 0} folds, accuracy: ${(rawM.accuracy*100||0).toFixed(1)}%, ` +
+                `AUC: ${(rawM.auc_roc||0).toFixed(3)}`;
+            showToast("Quant training complete!");
+            checkStatus(sym, "quant");
+            // Show backtest if available
+            if (data.backtest) {
+                displayQuantMetrics(data);
+            }
+        } catch (e) {
+            document.getElementById("train-progress").innerHTML = `<span class='text-red'>Lỗi: ${e.message}</span>`;
+            showToast("Quant training failed: " + e.message);
+        } finally {
+            document.getElementById("btn-train").disabled = false;
+        }
+    }
+
+    // ── Predict ───────────────────────────────────────────────────────
+    async function runPredict() {
+        const mode = getMode();
+        if (mode === "v2") {
+            const tickers = getTickerListInput();
+            if (tickers.length === 0) { showToast("Vui lòng nhập ít nhất 1 mã để dự đoán V2"); return; }
+            if (tickers.length > 1) showToast(`V2 predict chỉ dùng 1 mã, đang dùng ${tickers[0]}`);
+            await runV2Predict(tickers[0]);
+            return;
+        }
+
+        const s = getSymbol();
+        if (!s) return;
+
+        if (mode === "quant") {
+            await runQuantPredict(s);
+            return;
+        }
+        await loadPredictPage(s, mode);
+    }
+
+    // ── Quant Predict ─────────────────────────────────────────────────
+    async function runQuantPredict(sym) {
+        try {
+            const res = await fetch(`${API}/api/quant/predict/${sym}?auto_train=true&period=10y`);
+            const d = await res.json();
+            if (!res.ok) throw new Error(d.detail || 'Prediction failed');
+            displayQuantResult(d);
+        } catch (e) {
+            showToast("Quant predict failed: " + e.message);
+        }
+    }
+
+    function displayQuantResult(d) {
+        const card = document.getElementById("quant-result-card");
+        card.classList.remove("hidden");
+
+        const dir = d.direction || {};
+        const mh = d.multi_horizon || {};
+        const sigColor = dir.signal === 'UP' ? 'text-green' : dir.signal === 'DOWN' ? 'text-red' : 'text-yellow';
+
+        let html = `
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin-bottom:1.5rem">
+            <div class="stat-card">
+                <div class="text-muted" style="font-size:.8rem">Direction Signal</div>
+                <div class="${sigColor}" style="font-size:1.8rem;font-weight:800">${dir.signal} (${dir.strength})</div>
+            </div>
+            <div class="stat-card">
+                <div class="text-muted" style="font-size:.8rem">P(Up) calibrated</div>
+                <div style="font-size:1.8rem;font-weight:800">${(dir.calibrated_p_up*100).toFixed(1)}%</div>
+            </div>
+            <div class="stat-card">
+                <div class="text-muted" style="font-size:.8rem">Current Price</div>
+                <div style="font-size:1.4rem;font-weight:700">$${d.current_price}</div>
+            </div>
+            <div class="stat-card">
+                <div class="text-muted" style="font-size:.8rem">Excess vs NASDAQ</div>
+                <div style="font-size:1.4rem;font-weight:700">${d.excess_return_vs_nasdaq_pct > 0 ? '+' : ''}${d.excess_return_vs_nasdaq_pct.toFixed(2)}%</div>
+            </div>
+        </div>
+        <h3 style="margin-bottom:.8rem"><i class="fa-solid fa-clock-rotate-left"></i> Multi-Horizon Forecast</h3>
+        <table style="width:100%;border-collapse:collapse;margin-bottom:1.2rem">
+            <thead><tr style="border-bottom:1px solid var(--border)">
+                <th style="text-align:left;padding:.5rem">Horizon</th>
+                <th style="text-align:right;padding:.5rem">Return</th>
+                <th style="text-align:right;padding:.5rem">Target Price</th>
+            </tr></thead>
+            <tbody>
+                <tr><td style="padding:.4rem .5rem">1 Day</td><td style="text-align:right;padding:.4rem .5rem">${mh.return_1d_pct > 0 ? '+' : ''}${mh.return_1d_pct?.toFixed(2)}%</td><td style="text-align:right;padding:.4rem .5rem">$${mh.price_1d?.toFixed(2)}</td></tr>
+                <tr><td style="padding:.4rem .5rem">5 Days</td><td style="text-align:right;padding:.4rem .5rem">${mh.return_5d_pct > 0 ? '+' : ''}${mh.return_5d_pct?.toFixed(2)}%</td><td style="text-align:right;padding:.4rem .5rem">$${mh.price_5d?.toFixed(2)}</td></tr>
+                <tr><td style="padding:.4rem .5rem">30 Days</td><td style="text-align:right;padding:.4rem .5rem">${mh.return_30d_pct > 0 ? '+' : ''}${mh.return_30d_pct?.toFixed(2)}%</td><td style="text-align:right;padding:.4rem .5rem">$${mh.price_30d?.toFixed(2)}</td></tr>
+            </tbody>
+        </table>
+        <h3 style="margin-bottom:.5rem"><i class="fa-solid fa-network-wired"></i> Ensemble Weights</h3>
+        <div style="display:flex;gap:1.5rem;margin-bottom:1rem;flex-wrap:wrap">
+            <span><b>TFT:</b> ${((d.ensemble?.branch_weights?.tft||0)*100).toFixed(1)}%</span>
+            <span><b>BiLSTM:</b> ${((d.ensemble?.branch_weights?.bilstm||0)*100).toFixed(1)}%</span>
+            <span><b>GRU:</b> ${((d.ensemble?.branch_weights?.gru||0)*100).toFixed(1)}%</span>
+        </div>
+        <div style="background:var(--bg-secondary);padding:1rem;border-radius:10px;font-size:.9rem;line-height:1.6">
+            <b><i class="fa-solid fa-robot"></i> AI Explanation:</b><br>${d.ai_explanation || ''}
+        </div>`;
+
+        document.getElementById("quant-result-display").innerHTML = html;
+
+        // Feature importance chart
+        if (d.feature_importance && d.feature_importance.length > 0) {
+            const featCard = document.getElementById("quant-feat-card");
+            featCard.classList.remove("hidden");
+            const feats = d.feature_importance.slice(0, 12).reverse();
+            Plotly.newPlot('chart-feat-importance', [{
+                y: feats.map(f => f.feature),
+                x: feats.map(f => f.weight),
+                type: 'bar',
+                orientation: 'h',
+                marker: { color: '#6366f1' }
+            }], {
+                margin: { t: 10, b: 30, l: 120, r: 20 },
+                paper_bgcolor: 'transparent',
+                plot_bgcolor: 'transparent',
+                font: { color: getComputedStyle(document.body).getPropertyValue('--text-primary') },
+                xaxis: { title: 'Attention Weight' },
+            }, { responsive: true });
+        }
+
+        // Walk-forward metrics
+        if (d.walk_forward_metrics) {
+            displayQuantMetrics({ walk_forward: { raw_metrics: d.walk_forward_metrics?.raw, calibrated_metrics: d.walk_forward_metrics?.calibrated } });
+        }
+    }
+
+    function displayQuantMetrics(data) {
+        const card = document.getElementById("quant-metrics-card");
+        card.classList.remove("hidden");
+        const wf = data.walk_forward || {};
+        const raw = wf.raw_metrics || {};
+        const cal = wf.calibrated_metrics || {};
+        const bt = data.backtest || {};
+
+        let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.8rem">';
+        const metrics = [
+            ['Accuracy (raw)', `${(raw.accuracy*100||0).toFixed(1)}%`],
+            ['AUC-ROC (raw)', `${(raw.auc_roc||0).toFixed(3)}`],
+            ['Brier Score', `${(raw.brier_score||0).toFixed(4)}`],
+            ['F1 Score', `${(raw.f1||0).toFixed(3)}`],
+        ];
+        if (cal.accuracy) {
+            metrics.push(['Accuracy (calibrated)', `${(cal.accuracy*100||0).toFixed(1)}%`]);
+            metrics.push(['AUC-ROC (calibrated)', `${(cal.auc_roc||0).toFixed(3)}`]);
+        }
+        if (bt.sharpe_ratio !== undefined) {
+            metrics.push(['Sharpe Ratio', `${bt.sharpe_ratio}`]);
+            metrics.push(['Max Drawdown', `${bt.max_drawdown_pct}%`]);
+            metrics.push(['Win Rate', `${bt.win_rate_pct}%`]);
+            metrics.push(['Total Return', `${bt.total_return_pct}%`]);
+        }
+
+        metrics.forEach(([label, val]) => {
+            html += `<div class="stat-card"><div class="text-muted" style="font-size:.75rem">${label}</div><div style="font-size:1.1rem;font-weight:700">${val}</div></div>`;
+        });
+        html += '</div>';
+        document.getElementById("quant-wf-metrics").innerHTML = html;
+    }
+
+    // ── CSV ───────────────────────────────────────────────────────────
+    function dlCsv() {
+        const s = getSymbol();
+        const mode = getMode();
+        if (s) window.open(`${API}/api/download-csv/${s}?mode=${encodeURIComponent(mode)}`, "_blank");
+    }
+
+    // ── Model status check ────────────────────────────────────────────
+    async function checkStatus(symbol, mode = "simple") {
+        try {
+            const res = await fetch(`${API}/api/model-status/${symbol}?mode=${encodeURIComponent(mode)}`);
+            const data = await res.json();
+            const el = document.getElementById("model-status");
+            if (el) {
+                const version = data.latest_version?.version ? ` | version: ${data.latest_version.version}` : "";
+                el.innerHTML = data.trained
+                    ? `<span class="text-green">● Đã huấn luyện (${mode.toUpperCase()})</span> — ${data.meta?.updated || ""} trên <b>${data.meta?.device || "cpu"}</b>${version}`
+                    : `<span class="text-yellow">● Chưa huấn luyện (${mode.toUpperCase()})</span>`;
+            }
+        } catch (_) {}
+    }
+
+    document.getElementById("mode-input").addEventListener("change", applyModeDefaults);
+
+    const savedMode = (localStorage.getItem("vizigenesis-ai-mode") || "simple").toLowerCase();
+    if (["simple", "pro", "quant", "v2"].includes(savedMode)) {
+        document.getElementById("mode-input").value = savedMode;
+    }
+    applyModeDefaults();
+
+    // Auto-check on load if symbol in URL hash
+    if (location.hash) {
+        sym = location.hash.slice(1).toUpperCase();
+        if (sym) {
+            document.getElementById("sym-input").value = sym;
+            checkStatus(sym, getMode());
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // V2 Panel Mode Functions
+    // ═══════════════════════════════════════════════════════════════════
+
+    async function startV2Training(tickerList, epochs) {
+        document.getElementById("training-card").classList.remove("hidden");
+        document.getElementById("train-progress").innerHTML = "<i class='fa-solid fa-spinner fa-spin'></i> Building V2 panel dataset & training (multi-stock regime-aware)… This may take several minutes.";
+        document.getElementById("train-fill").style.width = "10%";
+        document.getElementById("btn-train").disabled = true;
+        try {
+            const tickersParam = (tickerList && tickerList.length > 0)
+                ? `tickers=${encodeURIComponent(tickerList.join(","))}&`
+                : "";
+            const res = await fetch(`${API}/api/v2/train?${tickersParam}period=10y&epochs=${epochs}`, { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || 'V2 Training failed');
+            document.getElementById("train-fill").style.width = "100%";
+            const wf = data.walk_forward || {};
+            document.getElementById("train-progress").innerHTML =
+                `<i class='fa-solid fa-circle-check text-green'></i> V2 Panel training complete — ` +
+                `${(data.tickers || []).join(", ") || "pilot_tickers"} | ${data.n_samples || 0} samples, ${data.n_features || 0} features. ` +
+                `Accuracy: ${((wf.accuracy || wf.raw?.accuracy || 0)*100).toFixed(1)}%`;
+            showToast("V2 Panel training complete!");
+        } catch (e) {
+            document.getElementById("train-progress").innerHTML = `<span class='text-red'>Lỗi: ${e.message}</span>`;
+            showToast("V2 training failed: " + e.message);
+        } finally {
+            document.getElementById("btn-train").disabled = false;
+        }
+    }
+
+    async function runV2Predict(sym) {
+        try {
+            showToast("Running V2 prediction for " + sym + "...");
+            const res = await fetch(`${API}/api/v2/predict/${sym}?period=2y`);
+            const d = await res.json();
+            if (!res.ok) throw new Error(d.detail || 'V2 Prediction failed');
+            displayV2Result(d);
+        } catch (e) {
+            showToast("V2 predict failed: " + e.message);
+        }
+    }
+
+    function displayV2Result(d) {
+        const card = document.getElementById("v2-result-card");
+        card.classList.remove("hidden");
+
+        const dir = d.direction || {};
+        const mh = d.multi_horizon || {};
+        const regime = d.regime || {};
+        const router = d.meta_router_weights || {};
+        const ens = d.ensemble || {};
+        const sigColor = dir.signal === 'UP' ? 'text-green' : dir.signal === 'DOWN' ? 'text-red' : 'text-yellow';
+        const regimeColor = regime.regime === 'bull' ? 'text-green' : regime.regime === 'bear' ? 'text-red' : 'text-yellow';
+
+        let html = `
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-bottom:1.5rem">
+            <div class="stat-card">
+                <div class="text-muted" style="font-size:.8rem">Direction</div>
+                <div class="${sigColor}" style="font-size:1.8rem;font-weight:800">${dir.signal} (${dir.strength})</div>
+            </div>
+            <div class="stat-card">
+                <div class="text-muted" style="font-size:.8rem">P(Up)</div>
+                <div style="font-size:1.8rem;font-weight:800">${(dir.p_up*100).toFixed(1)}%</div>
+            </div>
+            <div class="stat-card">
+                <div class="text-muted" style="font-size:.8rem">Market Regime</div>
+                <div class="${regimeColor}" style="font-size:1.4rem;font-weight:800">${(regime.regime||'unknown').toUpperCase()}</div>
+                <div style="font-size:.75rem;color:var(--text-muted)">Confidence: ${((regime.confidence||0)*100).toFixed(0)}%</div>
+            </div>
+            <div class="stat-card">
+                <div class="text-muted" style="font-size:.8rem">Uncertainty</div>
+                <div style="font-size:1.4rem;font-weight:700">${((d.uncertainty||0)*100).toFixed(1)}%</div>
+            </div>
+            <div class="stat-card">
+                <div class="text-muted" style="font-size:.8rem">Current Price</div>
+                <div style="font-size:1.4rem;font-weight:700">$${d.current_price}</div>
+            </div>
+            <div class="stat-card">
+                <div class="text-muted" style="font-size:.8rem">Excess vs NASDAQ</div>
+                <div style="font-size:1.4rem;font-weight:700">${d.excess_return_vs_nasdaq_pct > 0 ? '+' : ''}${(d.excess_return_vs_nasdaq_pct||0).toFixed(2)}%</div>
+            </div>
+        </div>
+        <h3 style="margin-bottom:.8rem"><i class="fa-solid fa-clock-rotate-left"></i> Multi-Horizon Forecast</h3>
+        <table style="width:100%;border-collapse:collapse;margin-bottom:1.2rem">
+            <thead><tr style="border-bottom:1px solid var(--border)">
+                <th style="text-align:left;padding:.5rem">Horizon</th>
+                <th style="text-align:right;padding:.5rem">Expected Return</th>
+                <th style="text-align:right;padding:.5rem">Target Price</th>
+            </tr></thead>
+            <tbody>
+                <tr><td style="padding:.4rem .5rem">1 Day</td><td style="text-align:right">${mh.return_1d_pct > 0 ? '+' : ''}${mh.return_1d_pct?.toFixed(2)}%</td><td style="text-align:right">$${mh.price_1d?.toFixed(2)}</td></tr>
+                <tr><td style="padding:.4rem .5rem">5 Days</td><td style="text-align:right">${mh.return_5d_pct > 0 ? '+' : ''}${mh.return_5d_pct?.toFixed(2)}%</td><td style="text-align:right">$${mh.price_5d?.toFixed(2)}</td></tr>
+                <tr><td style="padding:.4rem .5rem">30 Days</td><td style="text-align:right">${mh.return_30d_pct > 0 ? '+' : ''}${mh.return_30d_pct?.toFixed(2)}%</td><td style="text-align:right">$${mh.price_30d?.toFixed(2)}</td></tr>
+            </tbody>
+        </table>
+        <h3 style="margin-bottom:.5rem"><i class="fa-solid fa-network-wired"></i> Ensemble & Meta-Router</h3>
+        <div style="display:flex;gap:1.5rem;margin-bottom:.5rem;flex-wrap:wrap">
+            <span><b>TFT:</b> ${((ens.tft||0)*100).toFixed(1)}%</span>
+            <span><b>BiLSTM:</b> ${((ens.bilstm||0)*100).toFixed(1)}%</span>
+            <span><b>GRU:</b> ${((ens.gru||0)*100).toFixed(1)}%</span>
+        </div>
+        <div style="display:flex;gap:1.5rem;margin-bottom:1rem;flex-wrap:wrap;font-size:.9rem;color:var(--text-muted)">
+            <span>Meta-router: Neural=${((router.neural||0)*100).toFixed(0)}% | LightGBM=${((router.lgbm||0)*100).toFixed(0)}% | XGBoost=${((router.xgb||0)*100).toFixed(0)}%</span>
+        </div>
+        <div style="background:var(--bg-secondary);padding:1rem;border-radius:10px;font-size:.9rem;line-height:1.6">
+            <b><i class="fa-solid fa-robot"></i> AI Explanation:</b><br>${d.ai_explanation || ''}
+        </div>`;
+
+        document.getElementById("v2-result-display").innerHTML = html;
+
+        // Feature importance chart
+        if (d.feature_importance && d.feature_importance.length > 0) {
+            const featCard = document.getElementById("v2-feat-card");
+            featCard.classList.remove("hidden");
+            const feats = d.feature_importance.slice(0, 15).reverse();
+            Plotly.newPlot('chart-v2-feat-importance', [{
+                y: feats.map(f => f.feature),
+                x: feats.map(f => f.weight),
+                type: 'bar',
+                orientation: 'h',
+                marker: { color: '#8b5cf6' }
+            }], {
+                margin: { t: 10, b: 30, l: 140, r: 20 },
+                paper_bgcolor: 'transparent',
+                plot_bgcolor: 'transparent',
+                font: { color: getComputedStyle(document.body).getPropertyValue('--text-primary') },
+                xaxis: { title: 'Attention Weight' },
+            }, { responsive: true });
+        }
+
+        // Regime display
+        if (regime.regime) {
+            const regCard = document.getElementById("v2-regime-card");
+            regCard.classList.remove("hidden");
+            document.getElementById("v2-regime-display").innerHTML = `
+                <div style="display:flex;gap:2rem;flex-wrap:wrap;align-items:center">
+                    <div>
+                        <span style="font-size:2rem;font-weight:900" class="${regimeColor}">${regime.regime.toUpperCase()}</span>
+                        <div class="text-muted" style="font-size:.85rem">Streak: ${regime.streak || 'N/A'} days | Confidence: ${((regime.confidence||0)*100).toFixed(0)}%</div>
+                    </div>
+                </div>`;
+        }
+    }
+</script>
+</body>
+</html>

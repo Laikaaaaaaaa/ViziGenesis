@@ -1,0 +1,21 @@
+{
+  "trained_via": "predict_auto_train",
+  "auto_train_reason": "stale_scaler_price_regime",
+  "mode": "simple",
+  "training_period": "2y",
+  "epochs_run": 9,
+  "final_train_loss": 0.022065771743655205,
+  "final_val_loss": 0.24197211861610413,
+  "device": "cpu",
+  "seq_len": 60,
+  "input_size": 5,
+  "features": [
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Volume"
+  ],
+  "updated": "2026-03-06T14:43:24.038282",
+  "profile": "simple"
+}

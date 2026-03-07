@@ -1,0 +1,12 @@
+{
+  "device": "cpu",
+  "epochs_run": 10,
+  "final_train_loss": 0.006649221561383456,
+  "final_val_loss": 0.009930789315452179,
+  "artifact": {
+    "model": "models/VIC.VN/model.pt",
+    "scaler": "models/VIC.VN/scaler.pkl",
+    "metrics": "models/VIC.VN/metrics.json"
+  },
+  "updated": "2026-03-05T09:40:41.369212"
+}

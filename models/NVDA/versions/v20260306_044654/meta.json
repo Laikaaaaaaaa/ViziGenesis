@@ -1,0 +1,12 @@
+{
+  "device": "cpu",
+  "epochs_run": 3,
+  "final_train_loss": 0.10008665099740029,
+  "final_val_loss": 0.17202556133270264,
+  "artifact": {
+    "model": "models/NVDA/model.pt",
+    "scaler": "models/NVDA/scaler.pkl",
+    "metrics": "models/NVDA/metrics.json"
+  },
+  "updated": "2026-03-06T04:46:54.520214"
+}

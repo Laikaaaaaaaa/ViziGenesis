@@ -1,0 +1,62 @@
+{
+  "symbol": "NVDA",
+  "mode": "simple",
+  "period": "2y",
+  "device": "cpu",
+  "data_source": "local_sample_csv",
+  "epochs_run": 2,
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.343846096098423,
+      "val_loss": 0.4079127113024394
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.12489367052912712,
+      "val_loss": 0.2892737885316213
+    }
+  ],
+  "metrics": {
+    "val": {
+      "samples": 78,
+      "regression": {
+        "mse": 89.471573,
+        "rmse": 9.458941,
+        "mae": 8.784318,
+        "mape_percent": 6.0142
+      },
+      "trend_quality": {
+        "accuracy_percent": 42.3077,
+        "macro_precision": 0.471861,
+        "macro_recall": 0.352941,
+        "macro_f1": 0.232756,
+        "labels": [
+          "DOWN",
+          "NEUTRAL",
+          "UP"
+        ]
+      }
+    },
+    "test": {
+      "samples": 78,
+      "regression": {
+        "mse": 93.921623,
+        "rmse": 9.691317,
+        "mae": 8.502395,
+        "mape_percent": 4.3351
+      },
+      "trend_quality": {
+        "accuracy_percent": 35.8974,
+        "macro_precision": 0.286667,
+        "macro_recall": 0.344086,
+        "macro_f1": 0.196673,
+        "labels": [
+          "DOWN",
+          "NEUTRAL",
+          "UP"
+        ]
+      }
+    }
+  }
+}

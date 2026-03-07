@@ -1,0 +1,54 @@
+# ViziGenesis — Docker Compose
+# Production deployment with optional GPU support
+
+version: "3.9"
+
+services:
+  vizigenesis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vizigenesis-app
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist models and data across container restarts
+      - ./models:/app/models
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+      - VIZIGENESIS_ENV=production
+      # Optional: FRED API key for macro data
+      # - FRED_API_KEY=your_fred_api_key_here
+      # Optional: NewsAPI key for sentiment
+      # - NEWSAPI_KEY=your_newsapi_key_here
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v2/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # Uncomment for GPU support (requires nvidia-docker)
+  # vizigenesis-gpu:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: vizigenesis-gpu
+  #   ports:
+  #     - "8000:8000"
+  #   volumes:
+  #     - ./models:/app/models
+  #     - ./data:/app/data
+  #   environment:
+  #     - PYTHONUNBUFFERED=1
+  #     - VIZIGENESIS_ENV=production
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+  #   restart: unless-stopped

@@ -1,0 +1,100 @@
+{
+  "symbol": "VIC.VN",
+  "device": "cpu",
+  "data_source": "local_sample_csv",
+  "epochs_run": 10,
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.09472297951579094,
+      "val_loss": 0.07746159782012303
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.030899964086711407,
+      "val_loss": 0.05418357625603676
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.01455523851327598,
+      "val_loss": 0.040498015470802784
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.00868407582238433,
+      "val_loss": 0.014242900535464287
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.008955812687054277,
+      "val_loss": 0.01430590326587359
+    },
+    {
+      "epoch": 6,
+      "train_loss": 0.00786349712871015,
+      "val_loss": 0.019452566591401894
+    },
+    {
+      "epoch": 7,
+      "train_loss": 0.006079425336793065,
+      "val_loss": 0.012952963200708231
+    },
+    {
+      "epoch": 8,
+      "train_loss": 0.006418531946837902,
+      "val_loss": 0.014363132106761137
+    },
+    {
+      "epoch": 9,
+      "train_loss": 0.006856690952554345,
+      "val_loss": 0.022277703198293846
+    },
+    {
+      "epoch": 10,
+      "train_loss": 0.006649221561383456,
+      "val_loss": 0.009930789315452179
+    }
+  ],
+  "metrics": {
+    "val": {
+      "samples": 75,
+      "regression": {
+        "mse": 2.796282,
+        "rmse": 1.672209,
+        "mae": 1.351699,
+        "mape_percent": 2.205
+      },
+      "trend_quality": {
+        "accuracy_percent": 36.0,
+        "macro_precision": 0.295602,
+        "macro_recall": 0.319627,
+        "macro_f1": 0.304296,
+        "labels": [
+          "DOWN",
+          "NEUTRAL",
+          "UP"
+        ]
+      }
+    },
+    "test": {
+      "samples": 75,
+      "regression": {
+        "mse": 3.82821,
+        "rmse": 1.956581,
+        "mae": 1.559899,
+        "mape_percent": 2.5487
+      },
+      "trend_quality": {
+        "accuracy_percent": 30.6667,
+        "macro_precision": 0.277778,
+        "macro_recall": 0.291793,
+        "macro_f1": 0.271282,
+        "labels": [
+          "DOWN",
+          "NEUTRAL",
+          "UP"
+        ]
+      }
+    }
+  }
+}

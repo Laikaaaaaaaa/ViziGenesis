@@ -1,0 +1,90 @@
+{
+  "symbol": "MSFT",
+  "device": "cpu",
+  "data_source": "local_sample_csv",
+  "epochs_run": 8,
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.12360091395676136,
+      "val_loss": 0.0606037632872661
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.03774739429354668,
+      "val_loss": 0.13929140816132227
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.016684233490377665,
+      "val_loss": 0.026340654119849205
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.009978374582715333,
+      "val_loss": 0.014960225981970629
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.009113406483083963,
+      "val_loss": 0.015658629747728508
+    },
+    {
+      "epoch": 6,
+      "train_loss": 0.00771021842956543,
+      "val_loss": 0.011777021456509829
+    },
+    {
+      "epoch": 7,
+      "train_loss": 0.010806784266605973,
+      "val_loss": 0.024907654461761315
+    },
+    {
+      "epoch": 8,
+      "train_loss": 0.009634326165542006,
+      "val_loss": 0.03710760734975338
+    }
+  ],
+  "metrics": {
+    "val": {
+      "samples": 75,
+      "regression": {
+        "mse": 91.5961,
+        "rmse": 9.570585,
+        "mae": 7.649391,
+        "mape_percent": 2.1216
+      },
+      "trend_quality": {
+        "accuracy_percent": 37.3333,
+        "macro_precision": 0.350889,
+        "macro_recall": 0.344481,
+        "macro_f1": 0.343991,
+        "labels": [
+          "DOWN",
+          "NEUTRAL",
+          "UP"
+        ]
+      }
+    },
+    "test": {
+      "samples": 75,
+      "regression": {
+        "mse": 133.694824,
+        "rmse": 11.562648,
+        "mae": 9.492695,
+        "mape_percent": 2.6326
+      },
+      "trend_quality": {
+        "accuracy_percent": 29.3333,
+        "macro_precision": 0.276263,
+        "macro_recall": 0.278973,
+        "macro_f1": 0.261172,
+        "labels": [
+          "DOWN",
+          "NEUTRAL",
+          "UP"
+        ]
+      }
+    }
+  }
+}
