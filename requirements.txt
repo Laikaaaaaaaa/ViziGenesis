@@ -9,7 +9,7 @@ websockets==12.0
 # Data & Finance
 yfinance==0.2.40
 financedatabase==2.3.0
-tvdatafeed==2.1.0
+tradingview_ta==3.3.0
 pandas==2.2.2
 numpy==1.26.4
 
