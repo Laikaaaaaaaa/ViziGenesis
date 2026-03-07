@@ -1,24 +1,18 @@
 """
 Macro-economic data fetching for enhanced AI training.
 
-Provides macro indicators from the Federal Reserve / US market indices:
-  - S&P 500  (broad US market trend)
-  - NASDAQ   (tech sector)
-  - VIX      (CBOE Volatility Index — fear gauge)
-  - 10-Year Treasury Yield (interest rates / bond proxy)
-  - Inflation proxy (derived from US Dollar Index momentum)
+Primary source for core macro features is FRED series IDs:
+    - SP500
+    - NASDAQCOM
+    - VIXCLS
+    - GS10
 
-Quant-mode extras:
-  - SOXX     (Philadelphia Semiconductor Index ETF)
-  - SMH      (VanEck Semiconductor ETF)
-  - Gold     (GC=F — Gold futures)
-  - Oil      (CL=F — WTI Crude Oil futures)
-  - DXY      (US Dollar Index — raw level)
-
-All data is fetched via yfinance and cached for 2 hours.
+If FRED is unavailable for a series, this module falls back to Yahoo Finance
+tickers for that specific feature.
 """
 import logging
 import time
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -26,12 +20,19 @@ import pandas as pd
 
 logger = logging.getLogger("vizigenesis.macro")
 
-# ── Macro index tickers (all available via yfinance) ─────────────────
-MACRO_TICKERS: Dict[str, str] = {
-    "SP500":    "^GSPC",       # S&P 500 — broad US market trend
-    "NASDAQ":   "^IXIC",       # NASDAQ Composite — tech sector
-    "VIX":      "^VIX",        # CBOE Volatility Index — fear gauge
-    "BOND_10Y": "^TNX",        # 10-Year Treasury Yield
+# ── Core macro series (FRED first, Yahoo fallback) ───────────────────
+MACRO_FRED_SERIES: Dict[str, str] = {
+    "SP500": "SP500",          # S&P 500 index level
+    "NASDAQ": "NASDAQCOM",     # NASDAQ Composite
+    "VIX": "VIXCLS",           # CBOE Volatility Index close
+    "BOND_10Y": "GS10",        # 10-Year Treasury Constant Maturity Rate
+}
+
+MACRO_YAHOO_FALLBACK: Dict[str, str] = {
+    "SP500": "^GSPC",
+    "NASDAQ": "^IXIC",
+    "VIX": "^VIX",
+    "BOND_10Y": "^TNX",
 }
 _DXY_TICKER = "DX-Y.NYB"      # US Dollar Index — used for inflation proxy
 
@@ -80,6 +81,56 @@ def _fetch_single_close(ticker: str, period: str = "10y") -> Optional[pd.Series]
     return None
 
 
+def _period_to_start(period: str) -> str:
+    """Convert Yahoo-like period string to an ISO start date."""
+    raw = (period or "10y").strip().lower()
+    mapping_days = {
+        "1mo": 30,
+        "3mo": 90,
+        "6mo": 180,
+        "1y": 365,
+        "2y": 730,
+        "5y": 1825,
+        "10y": 3650,
+    }
+    if raw == "max":
+        return "1900-01-01"
+    days = mapping_days.get(raw, 3650)
+    start = datetime.utcnow().date() - timedelta(days=days)
+    return start.isoformat()
+
+
+def _fetch_fred_series(series_id: str, period: str = "10y") -> Optional[pd.Series]:
+    """
+    Fetch a FRED series by series_id using CSV endpoint.
+    This endpoint works without FRED_API_KEY for public series.
+    """
+    start = _period_to_start(period)
+    # Keep end date open to include latest value.
+    url = (
+        "https://fred.stlouisfed.org/graph/fredgraph.csv"
+        f"?id={series_id}&cosd={start}"
+    )
+    for attempt in range(2):
+        try:
+            df = pd.read_csv(url)
+            if df is None or df.empty:
+                continue
+            if "DATE" not in df.columns or series_id not in df.columns:
+                continue
+            series = pd.to_numeric(df[series_id], errors="coerce")
+            idx = pd.to_datetime(df["DATE"], errors="coerce")
+            out = pd.Series(series.values, index=idx).dropna()
+            out = out[~out.index.isna()]
+            if len(out) > 0:
+                out.name = series_id
+                return out.sort_index()
+        except Exception as e:
+            logger.debug("FRED fetch attempt %d for %s failed: %s", attempt + 1, series_id, e)
+            time.sleep(0.5)
+    return None
+
+
 # ── Public API ────────────────────────────────────────────────────────
 def fetch_macro_data(period: str = "10y") -> pd.DataFrame:
     """
@@ -100,15 +151,30 @@ def fetch_macro_data(period: str = "10y") -> pd.DataFrame:
         if time.time() - _macro_cache_ts.get(cache_key, 0) < _MACRO_CACHE_TTL:
             return _macro_cache[cache_key].copy()
 
-    # Fetch each macro ticker individually (most reliable across yfinance versions)
+    # Fetch each macro series from FRED first, then fallback to Yahoo when needed.
     frames: Dict[str, pd.Series] = {}
-    for name, ticker in MACRO_TICKERS.items():
-        series = _fetch_single_close(ticker, period)
+    for name, fred_series_id in MACRO_FRED_SERIES.items():
+        series = _fetch_fred_series(fred_series_id, period)
         if series is not None and len(series) > 0:
             frames[name] = series
-            logger.info("Macro %s (%s): %d rows", name, ticker, len(series))
-        else:
-            logger.warning("Macro %s (%s): unavailable", name, ticker)
+            logger.info("Macro %s (FRED:%s): %d rows", name, fred_series_id, len(series))
+            continue
+
+        yahoo_ticker = MACRO_YAHOO_FALLBACK.get(name, "")
+        if yahoo_ticker:
+            series = _fetch_single_close(yahoo_ticker, period)
+            if series is not None and len(series) > 0:
+                frames[name] = series
+                logger.warning(
+                    "Macro %s FRED unavailable (%s) — fallback Yahoo (%s): %d rows",
+                    name,
+                    fred_series_id,
+                    yahoo_ticker,
+                    len(series),
+                )
+                continue
+
+        logger.warning("Macro %s (FRED:%s): unavailable", name, fred_series_id)
 
     # DXY (Dollar Index) for inflation proxy
     dxy_series = _fetch_single_close(_DXY_TICKER, period)

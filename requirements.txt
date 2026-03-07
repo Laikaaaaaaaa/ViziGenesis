@@ -1,5 +1,5 @@
 # ViziGenesis — Dependencies
-# Python 3.9+
+# Python 3.10.11
 
 # Web framework
 fastapi==0.115.0

@@ -52,24 +52,26 @@ ViziGenesis/
 
 ### 1) Tạo môi trường ảo và cài thư viện
 
+Cần cài Python 3.10.11 trên máy trước khi chạy các lệnh dưới đây.
+
 **Windows (PowerShell):**
 
 ```powershell
-python -m venv venv
-venv\Scripts\Activate.ps1
+py -3.10 -m venv .venv
+.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
 ### 2) Chạy web app
 
 ```bash
-python run.py
+py -3.10 run.py
 ```
 
 Hoặc explicit mode:
 
 ```bash
-python run.py --mode serve --host 0.0.0.0 --port 8000 --reload
+py -3.10 run.py --mode serve --host 0.0.0.0 --port 8000 --reload
 ```
 
 Mở trình duyệt: **http://localhost:8000**
