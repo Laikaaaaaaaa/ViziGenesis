@@ -397,7 +397,7 @@ class PredictionHeads(nn.Module):
     3. **Practical**: a trader needs direction, magnitude, AND regime context
 
     Head outputs:
-    - direction:  P(price goes up)           (binary, BCE)
+    - direction:  logit(price goes up)       (binary, BCEWithLogits)
     - ret_Xd:    expected X-day return       (regression, Huber)
     - regime:    bull/bear/sideways           (3-class, CE)
     - confidence: model's self-assessed certainty (auxiliary)
@@ -409,7 +409,7 @@ class PredictionHeads(nn.Module):
         self.direction = nn.Sequential(
             nn.Linear(d, d // 2), nn.GELU(), nn.Dropout(cfg.dropout),
             nn.Linear(d // 2, d // 4), nn.GELU(),
-            nn.Linear(d // 4, 1), nn.Sigmoid(),
+            nn.Linear(d // 4, 1),
         )
 
         self.return_heads = nn.ModuleList([

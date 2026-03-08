@@ -184,10 +184,10 @@ def _compute_losses(preds: Dict[str, torch.Tensor],
     """Individual task losses (not weighted yet)."""
     losses = []
 
-    # Direction: binary cross-entropy
+    # Direction: binary cross-entropy with logits (autocast-safe)
     dir_pred = preds["direction"].squeeze(-1)
     dir_target = targets["direction"].squeeze(-1)
-    losses.append(F.binary_cross_entropy(dir_pred, dir_target))
+    losses.append(F.binary_cross_entropy_with_logits(dir_pred, dir_target))
 
     # Return regression: Huber loss (robust to outliers in financial returns)
     for key in ["ret_1d", "ret_5d", "ret_21d"]:
@@ -573,7 +573,7 @@ class ViziTrainer:
             n_batches += 1
 
             # Accumulate predictions
-            all_preds["direction"].append(preds["direction"].squeeze(-1).cpu().numpy())
+            all_preds["direction"].append(torch.sigmoid(preds["direction"]).squeeze(-1).cpu().numpy())
             all_targets["direction"].append(batch["targets"]["direction"].squeeze(-1).cpu().numpy())
             for key in ["ret_1d", "ret_5d", "ret_21d"]:
                 all_preds[key].append(preds[key].squeeze(-1).cpu().numpy())
@@ -612,7 +612,7 @@ class ViziTrainer:
             with _autocast_ctx(device_type=self.device.type, enabled=self.train_cfg.use_amp):
                 preds = self.model(batch)
 
-            all_preds["direction"].append(preds["direction"].squeeze(-1).cpu().numpy())
+            all_preds["direction"].append(torch.sigmoid(preds["direction"]).squeeze(-1).cpu().numpy())
             all_targets["direction"].append(batch["targets"]["direction"].squeeze(-1).cpu().numpy())
             for key in ["ret_1d", "ret_5d", "ret_21d"]:
                 all_preds[key].append(preds[key].squeeze(-1).cpu().numpy())
