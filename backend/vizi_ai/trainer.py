@@ -762,6 +762,7 @@ def train_per_stock_specialists(
         weight_decay=train_cfg.weight_decay,
     )
     loss_fn = UncertaintyMultiTaskLoss(n_tasks=5).to(device)
+    scaler = GradScaler(enabled=(train_cfg.use_amp and device.type == "cuda"))
 
     for sym_idx, sym in enumerate(symbols):
         loader = create_dataloader(
@@ -790,9 +791,29 @@ def train_per_stock_specialists(
                     task_losses = _compute_losses(preds, batch_dev["targets"])
                     loss, _ = loss_fn(task_losses)
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                # Skip pathological batches to keep warm-up stable.
+                if not torch.isfinite(loss):
+                    logger.warning("  Specialist %s: skipping non-finite loss batch", sym)
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+
+                optimizer.zero_grad(set_to_none=True)
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        filter(lambda p: p.requires_grad, model.parameters()),
+                        train_cfg.grad_clip,
+                    )
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        filter(lambda p: p.requires_grad, model.parameters()),
+                        train_cfg.grad_clip,
+                    )
+                    optimizer.step()
 
                 total_loss += loss.item()
                 n_batches += 1
