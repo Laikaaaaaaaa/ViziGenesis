@@ -88,6 +88,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-name", default="vizi-o1", help="Run name for vizi-train versioning")
     parser.add_argument("--vizi-epochs", type=int, default=30, help="Max epochs for vizi-train")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for vizi-train")
+    parser.add_argument("--vizi-lr", type=float, default=3e-4, help="Learning rate for vizi-train")
+    parser.add_argument("--vizi-d-model", type=int, default=None, help="Model width for vizi-train")
+    parser.add_argument("--vizi-n-layers", type=int, default=None, help="Encoder depth for vizi-train")
+    parser.add_argument("--vizi-val-every", type=int, default=500, help="Validate every N steps in vizi-train")
+    parser.add_argument("--vizi-patience", type=int, default=5, help="Early stopping patience for vizi-train")
     parser.add_argument("--specialist-warmup", action="store_true",
                         help="Enable per-stock specialist warm-up before vizi-train")
     parser.add_argument("--run-dir", default=None, help="Run directory for vizi-evaluate")
@@ -126,11 +131,11 @@ def main():
             run_name=args.run_name,
             epochs=args.vizi_epochs,
             batch_size=args.batch_size,
-            lr=3e-4,
-            d_model=None,
-            n_layers=None,
-            val_every=500,
-            patience=5,
+            lr=args.vizi_lr,
+            d_model=args.vizi_d_model,
+            n_layers=args.vizi_n_layers,
+            val_every=args.vizi_val_every,
+            patience=args.vizi_patience,
             specialist_warmup=args.specialist_warmup,
             skip_collect=True,
             section=None,
