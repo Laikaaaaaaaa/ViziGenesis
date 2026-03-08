@@ -127,6 +127,9 @@ class TrainConfig:
     # AMP
     use_amp: bool = True
 
+    # Specialist warm-up stability
+    specialist_lr_scale: float = 0.1
+
     # Versioning
     run_name: str = "vizi-o1"
     run_tag:  str = ""             # auto-set to timestamp
@@ -774,10 +777,18 @@ def train_per_stock_specialists(
 
     optimizer = AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=train_cfg.lr * 0.5,
+        lr=train_cfg.lr * train_cfg.specialist_lr_scale,
         weight_decay=train_cfg.weight_decay,
     )
-    loss_fn = UncertaintyMultiTaskLoss(n_tasks=5).to(device)
+    # Use fixed task weights during specialist warm-up for numerical stability.
+    # Learnable uncertainty weighting is kept for full-universe training phase.
+    warmup_weights = [
+        train_cfg.loss_w_direction,
+        train_cfg.loss_w_ret_1d,
+        train_cfg.loss_w_ret_5d,
+        train_cfg.loss_w_ret_21d,
+        train_cfg.loss_w_regime,
+    ]
     scaler = _make_grad_scaler(device.type, enabled=train_cfg.use_amp)
 
     for sym_idx, sym in enumerate(symbols):
@@ -802,10 +813,27 @@ def train_per_stock_specialists(
                     else:
                         batch_dev[k] = v
 
+                # Skip malformed/non-finite input batches early.
+                non_finite_input = False
+                for v in batch_dev.values():
+                    if isinstance(v, torch.Tensor) and v.is_floating_point() and not torch.isfinite(v).all():
+                        non_finite_input = True
+                        break
+                    if isinstance(v, dict):
+                        for vv in v.values():
+                            if isinstance(vv, torch.Tensor) and vv.is_floating_point() and not torch.isfinite(vv).all():
+                                non_finite_input = True
+                                break
+                    if non_finite_input:
+                        break
+                if non_finite_input:
+                    logger.warning("  Specialist %s: skipping non-finite input batch", sym)
+                    continue
+
                 with _autocast_ctx(device_type=device.type, enabled=train_cfg.use_amp):
                     preds = model(batch_dev)
                     task_losses = _compute_losses(preds, batch_dev["targets"])
-                    loss, _ = loss_fn(task_losses)
+                    loss = sum(w * l for w, l in zip(warmup_weights, task_losses))
 
                 # Skip pathological batches to keep warm-up stable.
                 if not torch.isfinite(loss):
