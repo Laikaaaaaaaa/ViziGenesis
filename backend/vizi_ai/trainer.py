@@ -35,6 +35,7 @@ Design rationale
 from __future__ import annotations
 
 import json, logging, math, os, shutil, time
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -57,6 +58,22 @@ logger = logging.getLogger("vizi_ai.trainer")
 
 ROOT = Path(__file__).resolve().parents[2]
 MODELS_DIR = ROOT / "models"
+
+
+def _autocast_ctx(device_type: str, enabled: bool = True):
+    """Compatibility wrapper across PyTorch AMP API versions."""
+    if not enabled:
+        return nullcontext()
+
+    # Newer API (torch.amp.autocast)
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast(device_type=device_type, enabled=enabled)
+
+    # Older API fallback (torch.cuda.amp.autocast)
+    if device_type == "cuda":
+        return autocast(enabled=enabled)
+
+    return nullcontext()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -433,7 +450,7 @@ class ViziTrainer:
                 # Move to device
                 batch = self._to_device(batch)
 
-                with autocast(device_type=self.device.type, enabled=cfg.use_amp):
+                with _autocast_ctx(device_type=self.device.type, enabled=cfg.use_amp):
                     preds = self.model(batch)
                     task_losses = _compute_losses(preds, batch["targets"])
                     total_loss, loss_info = self.loss_fn(task_losses)
@@ -547,7 +564,7 @@ class ViziTrainer:
 
         for batch in val_loader:
             batch = self._to_device(batch)
-            with autocast(device_type=self.device.type, enabled=self.train_cfg.use_amp):
+            with _autocast_ctx(device_type=self.device.type, enabled=self.train_cfg.use_amp):
                 preds = self.model(batch)
                 task_losses = _compute_losses(preds, batch["targets"])
                 loss, _ = self.loss_fn(task_losses)
@@ -592,7 +609,7 @@ class ViziTrainer:
 
         for batch in loader:
             batch = self._to_device(batch)
-            with autocast(device_type=self.device.type, enabled=self.train_cfg.use_amp):
+            with _autocast_ctx(device_type=self.device.type, enabled=self.train_cfg.use_amp):
                 preds = self.model(batch)
 
             all_preds["direction"].append(preds["direction"].squeeze(-1).cpu().numpy())
@@ -768,7 +785,7 @@ def train_per_stock_specialists(
                     else:
                         batch_dev[k] = v
 
-                with autocast(device_type=device.type, enabled=train_cfg.use_amp):
+                with _autocast_ctx(device_type=device.type, enabled=train_cfg.use_amp):
                     preds = model(batch_dev)
                     task_losses = _compute_losses(preds, batch_dev["targets"])
                     loss, _ = loss_fn(task_losses)
