@@ -41,6 +41,18 @@ def _load_env_file(env_path: str) -> None:
         pass
 
 
+def _set_vizi_perf_env(default_threads: int = 128) -> None:
+    """Set performance-related thread env vars for heavy vizi workloads.
+
+    Only sets values when they are not already provided by the user.
+    """
+    n_cpu = os.cpu_count() or default_threads
+    threads = str(min(default_threads, n_cpu))
+
+    os.environ.setdefault("NUMEXPR_MAX_THREADS", threads)
+    os.environ.setdefault("OMP_NUM_THREADS", threads)
+
+
 def run_backend_cli(mode: str, symbol: str, period: str, epoch: int, split: str, ai_mode: str):
     """Delegate non-serve actions to backend CLI."""
     cmd = [sys.executable, "-m", "backend.cli", mode, "--symbol", symbol]
@@ -123,6 +135,7 @@ def main():
 
     # ── Vizi-AI multi-modal modes ──
     if args.mode.startswith("vizi-"):
+        _set_vizi_perf_env(default_threads=128)
         from backend.vizi_ai import orchestrator
         vizi_cmd = args.mode.replace("vizi-", "")
         # Build a namespace matching the orchestrator's expectations
