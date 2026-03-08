@@ -107,6 +107,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vizi-patience", type=int, default=5, help="Early stopping patience for vizi-train")
     parser.add_argument("--specialist-warmup", action="store_true",
                         help="Enable per-stock specialist warm-up before vizi-train")
+    parser.add_argument("--parallel-stocks", type=int, default=0,
+                        help="Stocks per parallel mega-batch in Phase 1 (0=auto-detect from VRAM)")
     parser.add_argument("--run-dir", default=None, help="Run directory for vizi-evaluate")
 
     return parser
@@ -150,6 +152,7 @@ def main():
             val_every=args.vizi_val_every,
             patience=args.vizi_patience,
             specialist_warmup=args.specialist_warmup,
+            parallel_stocks=args.parallel_stocks,
             skip_collect=True,
             section=None,
             run_dir=args.run_dir or "",

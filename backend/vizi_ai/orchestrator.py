@@ -149,13 +149,14 @@ def cmd_train(args):
     trainer = ViziTrainer(model_cfg, data_cfg, train_cfg)
 
     if args.specialist_warmup:
-        logger.info("\n── Phase 1: Per-stock Specialist Warm-up ──")
+        logger.info("\n── Phase 1: Per-stock Specialist Warm-up (parallel) ──")
         train_per_stock_specialists(
             trainer.symbols[:50],  # top 50 by data size
             trainer.model,
             data_cfg,
             train_cfg,
             n_epochs=2,
+            num_parallel_stocks=getattr(args, "parallel_stocks", 0),
         )
 
     # ── Phase 2: Full-universe training ──
@@ -345,6 +346,8 @@ def _add_train_args(parser):
     parser.add_argument("--patience", type=int, default=5, help="Early stopping patience")
     parser.add_argument("--specialist-warmup", action="store_true",
                         help="Run per-stock specialist warm-up before full training")
+    parser.add_argument("--parallel-stocks", type=int, default=0,
+                        help="Stocks per parallel mega-batch in Phase 1 (0=auto-detect from VRAM)")
 
 
 def _add_collect_args(parser):

@@ -3,9 +3,11 @@ ViziGenesis vizi-o1 — Training Engine
 ======================================
 Handles the complete training lifecycle:
 
-  Phase 1: Per-stock specialist warm-up (optional)
+  Phase 1: Per-stock specialist warm-up (optional, **parallel**)
     Train lightweight heads on individual stocks to bootstrap
     good per-stock representations before full-universe training.
+    Multiple stocks are processed as a mega-batch on GPU for
+    maximum throughput (auto-sized to available VRAM).
 
   Phase 2: Full-universe multi-modal training
     Stream all stocks through the ViziMarketTransformer with
@@ -35,6 +37,8 @@ Design rationale
 from __future__ import annotations
 
 import json, logging, math, os, shutil, time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
@@ -743,7 +747,95 @@ class ViziTrainer:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Per-stock fine-tuning (Phase 1 — optional specialist warm-up)
+#  Phase 1 helpers — parallel specialist warm-up
+# ═══════════════════════════════════════════════════════════════
+
+def _estimate_parallel_stocks(
+    device: torch.device,
+    batch_size: int,
+    n_symbols: int,
+) -> int:
+    """
+    Estimate how many stocks can be mega-batched in one forward pass.
+
+    VRAM breakdown per stock (at batch_size=64, d_model=256, AMP FP16):
+      • Encoder forward (temporary, no grad stored for frozen params): ~60 MB
+      • Fusion activations stored for backward (4 layers, ~251 tokens): ~80 MB
+      • Head activations + gradient buffers: ~10 MB
+      • Input tensors on device: ~5 MB
+      ────────────────────────────────────────
+      ≈ 155 MB per stock at batch_size=64
+
+    We reserve 4 GB for the model, optimizer states, CUDA context, and
+    a safety margin.  Scales linearly with batch_size.
+    """
+    if device.type != "cuda":
+        return min(4, n_symbols)
+
+    total_gb = torch.cuda.get_device_properties(device).total_mem / (1 << 30)
+    reserve_gb = 4.0
+
+    per_stock_mb = 155.0 * (batch_size / 64)
+    available_mb = (total_gb - reserve_gb) * 1024
+
+    k = max(1, int(available_mb / per_stock_mb))
+    # Cap so that mega-batch doesn't exceed reasonable kernel sizes
+    k = min(k, n_symbols, 128)
+    return k
+
+
+def _has_non_finite_inputs(batch: Dict[str, Any]) -> bool:
+    """Return True if any floating-point tensor in *batch* contains NaN/Inf."""
+    for v in batch.values():
+        if isinstance(v, torch.Tensor) and v.is_floating_point() and not torch.isfinite(v).all():
+            return True
+        if isinstance(v, dict):
+            for vv in v.values():
+                if isinstance(vv, torch.Tensor) and vv.is_floating_point() and not torch.isfinite(vv).all():
+                    return True
+    return False
+
+
+def _move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+    """Move all tensors in a batch dict (including nested targets) to *device*."""
+    out: Dict[str, Any] = {}
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = v.to(device, non_blocking=True)
+        elif isinstance(v, dict):
+            out[k] = {kk: vv.to(device, non_blocking=True) for kk, vv in v.items()}
+        else:
+            out[k] = v
+    return out
+
+
+def _cat_batches(batches: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Concatenate a list of batch dicts along dim-0 into a single mega-batch."""
+    merged: Dict[str, Any] = {}
+    for key in batches[0]:
+        vals = [b[key] for b in batches]
+        if isinstance(vals[0], torch.Tensor):
+            merged[key] = torch.cat(vals, dim=0)
+        elif isinstance(vals[0], dict):
+            merged[key] = {
+                k: torch.cat([v[key][k] for v in batches], dim=0)
+                for k in vals[0]
+            }
+        else:
+            merged[key] = vals[0]
+    return merged
+
+
+def _prefetch_one(iterator):
+    """Pull the next batch from *iterator*; return (batch, True) or (None, False)."""
+    try:
+        return next(iterator), True
+    except StopIteration:
+        return None, False
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Per-stock fine-tuning (Phase 1 — parallel specialist warm-up)
 # ═══════════════════════════════════════════════════════════════
 def train_per_stock_specialists(
     symbols: List[str],
@@ -751,19 +843,26 @@ def train_per_stock_specialists(
     data_cfg: DataConfig,
     train_cfg: TrainConfig,
     n_epochs: int = 3,
+    num_parallel_stocks: int = 0,
 ):
     """
-    Quick per-stock fine-tuning pass.
+    Parallel per-stock fine-tuning pass.
 
     Freezes the shared encoders and only trains the prediction heads +
     stock embeddings.  This gives each stock a warm-started specialisation
     before the full multi-stock training phase.
 
-    Why?
-    Different stocks have different volatility profiles, sector dynamics,
-    and fundamental characteristics.  A brief per-stock pass helps the
-    model's output layers calibrate to individual stock distributions
-    before learning cross-stock patterns.
+    **Parallel mega-batch strategy (new)**
+    Stocks are grouped into chunks of ``num_parallel_stocks``.  Within
+    each chunk one batch per stock is drawn, concatenated along dim-0
+    into a single *mega-batch*, and forwarded through the model in one
+    GPU kernel.  This fully saturates tensor-core throughput on large
+    GPUs (e.g. H100) instead of leaving SMs idle with small per-stock
+    batches.
+
+    Args:
+        num_parallel_stocks: How many stocks per mega-batch.
+            0 (default) → auto-detect from available VRAM.
     """
     device = torch.device(train_cfg.device)
     model.to(device)
@@ -775,13 +874,14 @@ def train_per_stock_specialists(
         else:
             param.requires_grad = False
 
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+
     optimizer = AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
+        trainable_params,
         lr=train_cfg.lr * train_cfg.specialist_lr_scale,
         weight_decay=train_cfg.weight_decay,
     )
     # Use fixed task weights during specialist warm-up for numerical stability.
-    # Learnable uncertainty weighting is kept for full-universe training phase.
     warmup_weights = [
         train_cfg.loss_w_direction,
         train_cfg.loss_w_ret_1d,
@@ -791,83 +891,171 @@ def train_per_stock_specialists(
     ]
     scaler = _make_grad_scaler(device.type, enabled=train_cfg.use_amp)
 
-    for sym_idx, sym in enumerate(symbols):
-        loader = create_dataloader(
-            [sym], data_cfg, "train",
-            batch_size=train_cfg.batch_size,
-            shuffle=True,
+    # ── Determine group size ──
+    if num_parallel_stocks <= 0:
+        num_parallel_stocks = _estimate_parallel_stocks(
+            device, train_cfg.batch_size, len(symbols),
         )
+    logger.info(
+        "Phase 1 — parallel specialist warm-up: %d stocks in groups of %d "
+        "(batch_size=%d → mega-batch up to %d)",
+        len(symbols),
+        num_parallel_stocks,
+        train_cfg.batch_size,
+        num_parallel_stocks * train_cfg.batch_size,
+    )
 
-        total_loss = 0.0
-        n_batches = 0
+    total_sym_done = 0
+    phase1_t0 = time.time()
+
+    # ── Process groups ──
+    for g_start in range(0, len(symbols), num_parallel_stocks):
+        group_syms = symbols[g_start : g_start + num_parallel_stocks]
+        K = len(group_syms)
+
+        loaders = [
+            create_dataloader(
+                [sym], data_cfg, "train",
+                batch_size=train_cfg.batch_size,
+                shuffle=True,
+            )
+            for sym in group_syms
+        ]
+
+        per_stock_loss = [0.0] * K
+        per_stock_batches = [0] * K
+        group_t0 = time.time()
+
         model.train()
 
-        for _epoch in range(n_epochs):
-            for batch in loader:
-                batch_dev = {}
-                for k, v in batch.items():
-                    if isinstance(v, torch.Tensor):
-                        batch_dev[k] = v.to(device, non_blocking=True)
-                    elif isinstance(v, dict):
-                        batch_dev[k] = {kk: vv.to(device, non_blocking=True) for kk, vv in v.items()}
-                    else:
-                        batch_dev[k] = v
+        for epoch in range(n_epochs):
+            iters = [iter(ld) for ld in loaders]
+            exhausted = [False] * K
+            round_idx = 0
 
-                # Skip malformed/non-finite input batches early.
-                non_finite_input = False
-                for v in batch_dev.values():
-                    if isinstance(v, torch.Tensor) and v.is_floating_point() and not torch.isfinite(v).all():
-                        non_finite_input = True
-                        break
-                    if isinstance(v, dict):
-                        for vv in v.values():
-                            if isinstance(vv, torch.Tensor) and vv.is_floating_point() and not torch.isfinite(vv).all():
-                                non_finite_input = True
-                                break
-                    if non_finite_input:
-                        break
-                if non_finite_input:
-                    logger.warning("  Specialist %s: skipping non-finite input batch", sym)
+            while not all(exhausted):
+                # ── Prefetch one batch per stock in thread pool ──
+                fetched: List[Optional[Dict[str, Any]]] = [None] * K
+                with ThreadPoolExecutor(max_workers=min(K, 8)) as pool:
+                    futures = {}
+                    for i in range(K):
+                        if not exhausted[i]:
+                            futures[i] = pool.submit(_prefetch_one, iters[i])
+                    for i, fut in futures.items():
+                        batch, ok = fut.result()
+                        if ok:
+                            fetched[i] = batch
+                        else:
+                            exhausted[i] = True
+
+                # ── Move to device & filter non-finite inputs ──
+                ready: List[Tuple[int, Dict[str, Any]]] = []
+                for i in range(K):
+                    if fetched[i] is None:
+                        continue
+                    batch_dev = _move_batch_to_device(fetched[i], device)
+                    if _has_non_finite_inputs(batch_dev):
+                        logger.warning(
+                            "  Specialist %s: skipping non-finite input (epoch %d)",
+                            group_syms[i], epoch + 1,
+                        )
+                        continue
+                    ready.append((i, batch_dev))
+
+                if not ready:
                     continue
 
-                with _autocast_ctx(device_type=device.type, enabled=train_cfg.use_amp):
-                    preds = model(batch_dev)
-                    task_losses = _compute_losses(preds, batch_dev["targets"])
-                    loss = sum(w * l for w, l in zip(warmup_weights, task_losses))
+                # ── Build mega-batch (concatenate along dim-0) ──
+                stock_batch_sizes = [b["price_seq"].size(0) for _, b in ready]
+                mega_batch = _cat_batches([b for _, b in ready])
 
-                # Skip pathological batches to keep warm-up stable.
-                if not torch.isfinite(loss):
-                    logger.warning("  Specialist %s: skipping non-finite loss batch", sym)
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
-
+                # ── Forward + loss (single GPU kernel on the mega-batch) ──
                 optimizer.zero_grad(set_to_none=True)
-                if scaler.is_enabled():
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        filter(lambda p: p.requires_grad, model.parameters()),
-                        train_cfg.grad_clip,
-                    )
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        filter(lambda p: p.requires_grad, model.parameters()),
-                        train_cfg.grad_clip,
-                    )
-                    optimizer.step()
 
-                total_loss += loss.item()
-                n_batches += 1
+                try:
+                    with _autocast_ctx(device_type=device.type, enabled=train_cfg.use_amp):
+                        preds = model(mega_batch)
+                        task_losses = _compute_losses(preds, mega_batch["targets"])
+                        total_loss = sum(w * l for w, l in zip(warmup_weights, task_losses))
 
-        avg = total_loss / max(1, n_batches)
-        logger.info("  Specialist %s (%d/%d): avg_loss=%.4f (%d batches)",
-                     sym, sym_idx + 1, len(symbols), avg, n_batches)
+                    if not torch.isfinite(total_loss):
+                        logger.warning(
+                            "  Group %d round %d: non-finite mega-batch loss — skipping",
+                            g_start // num_parallel_stocks + 1, round_idx,
+                        )
+                        optimizer.zero_grad(set_to_none=True)
+                        round_idx += 1
+                        continue
+
+                    # ── Backward + step ──
+                    if scaler.is_enabled():
+                        scaler.scale(total_loss).backward()
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(trainable_params, train_cfg.grad_clip)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        total_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(trainable_params, train_cfg.grad_clip)
+                        optimizer.step()
+
+                except RuntimeError as exc:
+                    if "out of memory" in str(exc).lower():
+                        # OOM on this mega-batch — log, free memory, skip round
+                        logger.warning(
+                            "  CUDA OOM in group %d round %d (%d stocks, mega-batch %d) — skipping round",
+                            g_start // num_parallel_stocks + 1,
+                            round_idx,
+                            len(ready),
+                            sum(stock_batch_sizes),
+                        )
+                        optimizer.zero_grad(set_to_none=True)
+                        torch.cuda.empty_cache()
+                        round_idx += 1
+                        continue
+                    raise
+
+                # ── Per-stock loss tracking (no-grad slicing) ──
+                with torch.no_grad():
+                    offset = 0
+                    for j, (stock_idx, _) in enumerate(ready):
+                        bs = stock_batch_sizes[j]
+                        sliced_preds = {k: v[offset:offset + bs] for k, v in preds.items()}
+                        sliced_tgts = {k: v[offset:offset + bs] for k, v in mega_batch["targets"].items()}
+                        tl = _compute_losses(sliced_preds, sliced_tgts)
+                        sl = sum(w * l for w, l in zip(warmup_weights, tl))
+                        per_stock_loss[stock_idx] += sl.item()
+                        per_stock_batches[stock_idx] += 1
+                        offset += bs
+
+                round_idx += 1
+
+        # ── Group summary ──
+        group_elapsed = time.time() - group_t0
+        for i, sym in enumerate(group_syms):
+            total_sym_done += 1
+            avg_loss = per_stock_loss[i] / max(1, per_stock_batches[i])
+            logger.info(
+                "  Specialist %-10s (%3d/%d): avg_loss=%.4f  (%d batches)",
+                sym, total_sym_done, len(symbols), avg_loss, per_stock_batches[i],
+            )
+        logger.info(
+            "  Group %d/%d done — %d stocks in %.1fs  (%.2f stocks/s)",
+            g_start // num_parallel_stocks + 1,
+            math.ceil(len(symbols) / num_parallel_stocks),
+            K, group_elapsed,
+            K / max(0.01, group_elapsed),
+        )
 
     # Unfreeze everything for Phase 2
     for param in model.parameters():
         param.requires_grad = True
 
-    logger.info("Per-stock specialist warm-up complete for %d stocks", len(symbols))
+    elapsed = time.time() - phase1_t0
+    logger.info(
+        "Phase 1 specialist warm-up complete — %d stocks, %d groups, %.1fs total (%.2f stocks/s)",
+        len(symbols),
+        math.ceil(len(symbols) / num_parallel_stocks),
+        elapsed,
+        len(symbols) / max(0.01, elapsed),
+    )
