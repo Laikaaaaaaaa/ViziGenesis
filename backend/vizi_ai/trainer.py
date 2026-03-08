@@ -191,6 +191,24 @@ def _compute_losses(preds: Dict[str, torch.Tensor],
 # ═══════════════════════════════════════════════════════════════
 def _compute_metrics(all_preds: Dict[str, List], all_targets: Dict[str, List]) -> Dict[str, float]:
     """Compute evaluation metrics from accumulated predictions."""
+    if not all_preds["direction"] or not all_targets["direction"]:
+        return {
+            "direction_accuracy": 0.0,
+            "ret_1d_mse": 0.0,
+            "ret_1d_mae": 0.0,
+            "ret_5d_mse": 0.0,
+            "ret_5d_mae": 0.0,
+            "ret_21d_mse": 0.0,
+            "ret_21d_mae": 0.0,
+            "ret_1d_dir_acc": 0.0,
+            "ret_5d_dir_acc": 0.0,
+            "ret_21d_dir_acc": 0.0,
+            "regime_accuracy": 0.0,
+            "sharpe_ratio": 0.0,
+            "ret_1d_IC": 0.0,
+            "ret_5d_IC": 0.0,
+        }
+
     metrics = {}
 
     # Direction accuracy
@@ -585,6 +603,23 @@ class ViziTrainer:
             all_preds["regime"].append(preds["regime"].argmax(dim=-1).cpu().numpy())
             all_targets["regime"].append(batch["targets"]["regime"].squeeze(-1).cpu().numpy())
             all_stocks.extend(batch["stock_id"].cpu().numpy().tolist())
+
+        if not all_preds["direction"]:
+            logger.warning("No samples found for split '%s'. Check data availability (e.g., Git LFS pull).", split)
+            report = {
+                "split": split,
+                "n_samples": 0,
+                "n_stocks": 0,
+                "aggregate": _compute_metrics(all_preds, all_targets),
+                "per_stock": {},
+                "timestamp": datetime.now().isoformat(),
+            }
+            if save_dir:
+                save_dir = Path(save_dir)
+                save_dir.mkdir(parents=True, exist_ok=True)
+                with open(save_dir / f"eval_{split}.json", "w") as f:
+                    json.dump(report, f, indent=2)
+            return report
 
         # Aggregate metrics
         agg_metrics = _compute_metrics(all_preds, all_targets)
