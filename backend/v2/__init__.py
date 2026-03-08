@@ -6,9 +6,9 @@ Understands macro/Fed policy and market psychology.
 
 Modules:
   config       – central configuration & hyperparameters
-  fred_data    – FRED macro-economic data ingestion
+  market_data  – multi-source market data engine (60+ tickers, World Bank, etc.)
   sentiment    – news & social sentiment signals
-  features     – unified feature engineering (60+ features)
+  features     – unified feature engineering (160+ features)
   regime       – regime detection (bull / bear / sideways)
   panel_data   – panel data loader for cross-stock training
   model        – hybrid deep-learning architecture (TFT encoder + heads)

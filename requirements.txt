@@ -22,8 +22,7 @@ joblib==1.4.2
 lightgbm>=4.1.0
 xgboost>=2.0.0
 
-# V2 — FRED macro data (optional — falls back to Yahoo proxy)
-# fredapi>=0.5.1
+# Macro data source: World Bank Data360 (no dedicated client dependency required)
 
 # Utilities
 aiofiles==24.1.0

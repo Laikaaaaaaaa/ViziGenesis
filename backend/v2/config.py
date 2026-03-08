@@ -3,6 +3,9 @@ ViziGenesis V2 — Central Configuration
 ========================================
 All hyper-parameters, feature lists, asset universes, and operational
 constants for the institutional-grade quant pipeline.
+
+Optimized for RTX 4090 24 GB — large model, deep training, 150+ features,
+multi-million row datasets from 60+ open market data sources.
 """
 import os, torch
 
@@ -25,9 +28,26 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 USE_AMP = torch.cuda.is_available()       # mixed-precision on GPU
 
 # ═══════════════════════════════════════════════════════════════════════
-# Asset universe
+# Asset universe — expanded to 25 diverse, liquid US stocks
 # ═══════════════════════════════════════════════════════════════════════
-PILOT_TICKERS = ["AAPL", "MSFT", "AMZN", "TSLA", "NVDA"]
+PILOT_TICKERS = [
+    # Mega-cap Tech
+    "AAPL", "MSFT", "AMZN", "GOOGL", "META", "NVDA", "TSLA",
+    # Semiconductors
+    "AMD", "INTC", "AVGO",
+    # Finance
+    "JPM", "GS", "BAC",
+    # Healthcare
+    "UNH", "JNJ", "PFE",
+    # Energy
+    "XOM", "CVX",
+    # Consumer
+    "WMT", "HD",
+    # Industrials
+    "CAT", "BA",
+    # Diversified
+    "BRK-B", "DIS", "NFLX",
+]
 
 # Benchmark / market context tickers
 BENCHMARK_TICKER   = "^GSPC"              # S&P 500
@@ -36,60 +56,38 @@ VIX_TICKER         = "^VIX"
 BOND_10Y_TICKER    = "^TNX"
 DXY_TICKER         = "DX-Y.NYB"
 
-# Sector / cross-asset
-SECTOR_TICKERS = {
-    "SOXX": "SOXX",       # semiconductor ETF
-    "SMH":  "SMH",        # VanEck semiconductor
+# Macro feature keys (backward-compatible identity mapping)
+MACRO_SERIES = {
+    "fed_funds":       "fed_funds",
+    "fed_balance":     "fed_balance",
+    "m2":              "m2",
+    "treasury_2y":     "treasury_2y",
+    "treasury_10y":    "treasury_10y",
+    "cpi":             "cpi",
+    "pce":             "pce",
+    "core_pce":        "core_pce",
+    "unemployment":    "unemployment",
+    "nonfarm_payroll": "nonfarm_payroll",
+    "baa_spread":      "baa_spread",
+    "ted_spread":      "ted_spread",
 }
-COMMODITY_TICKERS = {
-    "Gold": "GC=F",
-    "Oil":  "CL=F",
-}
+FRED_SERIES = MACRO_SERIES  # backward compatibility alias
 
 # ═══════════════════════════════════════════════════════════════════════
-# FRED series IDs  (free — no API key for most)
+# Hyper-parameters — Model (RTX 4090 24 GB optimized)
 # ═══════════════════════════════════════════════════════════════════════
-FRED_SERIES = {
-    # ── Federal Reserve / Monetary Policy ──
-    "fed_funds":       "DFF",            # effective federal-funds rate (daily)
-    "fed_balance":     "WALCL",          # Fed total assets (weekly)
-    "m2":              "M2SL",           # M2 money supply (monthly)
-
-    # ── Treasury yields / term structure ──
-    "treasury_2y":     "DGS2",           # 2-year Treasury yield (daily)
-    "treasury_10y":    "DGS10",          # 10-year Treasury yield (daily)
-
-    # ── Inflation ──
-    "cpi":             "CPIAUCSL",       # CPI urban consumers (monthly)
-    "pce":             "PCEPI",          # PCE price index (monthly)
-    "core_pce":        "PCEPILFE",       # core PCE ex food & energy
-
-    # ── Employment ──
-    "unemployment":    "UNRATE",         # civilian unemployment rate (monthly)
-    "nonfarm_payroll": "PAYEMS",         # nonfarm payrolls (monthly)
-
-    # ── Credit & financial conditions ──
-    "baa_spread":      "BAAFFM",         # BAA corporate bond spread (monthly)
-    "ted_spread":      "TEDRATE",        # TED spread (discontinued → fallback)
-}
-
-# FOMC meeting dates (approximate) — updated periodically
-FOMC_DATES_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
-
-# ═══════════════════════════════════════════════════════════════════════
-# Hyper-parameters — Model
-# ═══════════════════════════════════════════════════════════════════════
-SEQ_LEN         = 60          # configurable lookback window
-D_MODEL         = 192         # hidden dimension (shared encoder)
-N_HEADS         = 8           # multi-head attention heads
-N_LAYERS        = 3           # transformer / RNN layers
-DROPOUT         = 0.30        # regularisation
-LEARNING_RATE   = 1e-4        # AdamW
-WEIGHT_DECAY    = 1e-5
-BATCH_SIZE      = 512         # panel training
-MAX_EPOCHS      = 220
-PATIENCE        = 10          # early-stop patience
+SEQ_LEN         = 120         # 6-month lookback (more context)
+D_MODEL         = 384         # large hidden dimension
+N_HEADS         = 12          # attention heads (384 / 12 = 32 per head)
+N_LAYERS        = 6           # deep transformer / RNN stack
+DROPOUT         = 0.25        # regularisation (slightly less for bigger model)
+LEARNING_RATE   = 5e-5        # lower LR for larger model
+WEIGHT_DECAY    = 1e-4        # stronger weight decay
+BATCH_SIZE      = 768         # RTX 4090 can handle this with AMP
+MAX_EPOCHS      = 800         # deep training — RTX 4090 handles this
+PATIENCE        = 25          # more patience for deeper convergence
 GRAD_CLIP       = 1.0         # gradient clipping norm
+GRAD_ACCUM_STEPS = 2          # effective batch = 768 × 2 = 1536
 
 # ═══════════════════════════════════════════════════════════════════════
 # Hyper-parameters — Training strategy
@@ -101,17 +99,17 @@ MIN_ROWS        = 500         # minimum rows per stock to include
 WF_MIN_TRAIN_YEARS = 5
 WF_VAL_YEARS       = 1
 WF_STEP_YEARS      = 1
-WF_N_FOLDS_MAX     = 10       # cap number of folds
+WF_N_FOLDS_MAX     = 15       # more folds for better evaluation
 
 # ═══════════════════════════════════════════════════════════════════════
 # Loss weights  ( regression + α*classification + β*regime )
 # ═══════════════════════════════════════════════════════════════════════
-LOSS_W_DIRECTION  = 2.0       # α  —  direction BCE
+LOSS_W_DIRECTION  = 2.5       # α  —  direction BCE (primary objective)
 LOSS_W_RET_1D     = 1.0
-LOSS_W_RET_5D     = 0.5
-LOSS_W_RET_30D    = 0.3
-LOSS_W_EXCESS     = 0.5
-LOSS_W_REGIME     = 0.3       # β  —  regime CE
+LOSS_W_RET_5D     = 0.8
+LOSS_W_RET_30D    = 0.5
+LOSS_W_EXCESS     = 0.7
+LOSS_W_REGIME     = 0.5       # β  —  regime CE (important for context)
 
 # ═══════════════════════════════════════════════════════════════════════
 # Horizons & targets
@@ -139,6 +137,7 @@ CRISIS_PERIODS = {
     "GFC_2008":       ("2007-10-01", "2009-03-31"),
     "COVID_2020":     ("2020-02-01", "2020-06-30"),
     "RATE_HIKE_2022": ("2022-01-01", "2022-12-31"),
+    "BANKING_2023":   ("2023-03-01", "2023-05-31"),
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -170,67 +169,198 @@ FEAT_LAG = [
     "Return_Lag_5", "Return_Lag_10", "Return_Lag_20",
 ]
 
-# Group 6: FRED macro (9)
-FEAT_FRED = [
+# Group 6: Macro economic (9) — legacy column names preserved
+FEAT_MACRO = [
     "Fed_Funds_Rate", "Delta_Fed_Funds",
     "Fed_Balance_Change",
     "CPI_YoY", "PCE_YoY",
     "Unemployment",
-    "Term_Spread",     # 10y − 2y
+    "Term_Spread",     # 10y − 3m
     "BAA_Spread",
     "M2_Growth",
 ]
+FEAT_FRED = FEAT_MACRO  # backward compatibility alias
 
 # Group 7: FOMC / policy events (3)
 FEAT_FOMC = [
-    "FOMC_Decision_Flag",     # 1 on FOMC day, 0 otherwise
-    "FOMC_Rate_Surprise",     # actual − expected (continuous)
-    "Policy_Stance",          # −1 dovish, 0 neutral, +1 hawkish
+    "FOMC_Decision_Flag",
+    "FOMC_Rate_Surprise",
+    "Policy_Stance",
 ]
 
 # Group 8: Market context (5)
 FEAT_MARKET = ["SP500_Ret", "NASDAQ_Ret", "VIX", "BOND_10Y", "DXY"]
 
-# Group 9: Sector / cross-asset (4)
+# Group 9: Sector / cross-asset legacy (4) — kept for compatibility
 FEAT_SECTOR = ["SOXX_Ret", "SMH_Ret", "Gold_Ret", "Oil_Ret"]
 
 # Group 10: Sentiment (4)
 FEAT_SENTIMENT = [
-    "News_Sentiment",          # rolling avg headline sentiment
-    "Social_Sentiment",        # social media momentum
-    "Put_Call_Proxy",          # VIX/realised vol ratio as proxy
-    "Fear_Greed_Proxy",        # composite fear/greed
+    "News_Sentiment",
+    "Social_Sentiment",
+    "Put_Call_Proxy",
+    "Fear_Greed_Proxy",
 ]
 
 # Group 11: Regime proxies (3)
 FEAT_REGIME_PROXY = [
-    "Realised_Vol_20",         # 20-day realised volatility
-    "VIX_Regime",              # z-scored VIX
-    "Market_Breadth_Proxy",    # SP500 momentum as breadth proxy
+    "Realised_Vol_20",
+    "VIX_Regime",
+    "Market_Breadth_Proxy",
 ]
 
-# Full V2 feature list (59 features)
-V2_FEATURE_COLS = (
-    FEAT_OHLCV
-    + FEAT_TECH_CLASSIC
-    + FEAT_ENGINEERED
-    + FEAT_TECH_ADV
-    + FEAT_LAG
-    + FEAT_FRED
-    + FEAT_FOMC
-    + FEAT_MARKET
-    + FEAT_SECTOR
-    + FEAT_SENTIMENT
-    + FEAT_REGIME_PROXY
-)
+# ── NEW Group 12: Yield Curve & Interest Rate Structure (8) ──────────
+FEAT_YIELD_CURVE = [
+    "Yield_10Y_3M_Spread",
+    "Yield_10Y_5Y_Spread",
+    "Yield_30Y_10Y_Spread",
+    "Yield_Curve_Curvature",
+    "Yield_Level",
+    "Yield_10Y_Change_5d",
+    "Yield_10Y_Change_20d",
+    "TIPS_vs_Treasury",
+]
 
-N_FEATURES = len(V2_FEATURE_COLS)   # should be 59
+# ── NEW Group 13: Credit & Bond Market (4) ───────────────────────────
+FEAT_CREDIT = [
+    "HY_IG_Spread",
+    "Credit_Risk_Appetite",
+    "TLT_Ret_5d",
+    "TLT_Ret_20d",
+]
+
+# ── NEW Group 14: Sector Rotation (26) ───────────────────────────────
+FEAT_SECTOR_ROTATION = [
+    "XLK_Ret_5d", "XLK_Ret_20d",
+    "XLF_Ret_5d", "XLF_Ret_20d",
+    "XLE_Ret_5d", "XLE_Ret_20d",
+    "XLV_Ret_5d", "XLV_Ret_20d",
+    "XLI_Ret_5d", "XLI_Ret_20d",
+    "XLP_Ret_5d", "XLP_Ret_20d",
+    "XLY_Ret_5d", "XLY_Ret_20d",
+    "XLB_Ret_5d", "XLB_Ret_20d",
+    "XLU_Ret_5d", "XLU_Ret_20d",
+    "XLRE_Ret_5d", "XLRE_Ret_20d",
+    "XLC_Ret_5d", "XLC_Ret_20d",
+    "Risk_On_Off",
+    "Consumer_Cyclical_vs_Defensive",
+    "Sector_Dispersion",
+    "SOXX_Ret",   # semiconductor from sector module (not legacy)
+]
+
+# ── NEW Group 15: Commodities (14) ───────────────────────────────────
+FEAT_COMMODITIES = [
+    "Gold_Ret", "Gold_Ret_20d",
+    "Silver_Ret", "Silver_Ret_20d",
+    "Oil_Ret", "Oil_Ret_20d",
+    "Brent_Ret", "Brent_Ret_20d",
+    "NatGas_Ret", "NatGas_Ret_20d",
+    "Copper_Ret", "Copper_Ret_20d",
+    "Gold_Oil_Ratio",
+    "Copper_Gold_Ratio",
+]
+
+# ── NEW Group 16: Currencies (11) ────────────────────────────────────
+FEAT_CURRENCIES = [
+    "DXY_Change", "DXY_Change_20d", "DXY_Momentum",
+    "EURUSD_Change", "EURUSD_Change_20d",
+    "GBPUSD_Change", "GBPUSD_Change_20d",
+    "USDJPY_Change", "USDJPY_Change_20d",
+    "USDCNY_Change", "USDCNY_Change_20d",
+]
+
+# ── NEW Group 17: Crypto Risk Appetite (5) ───────────────────────────
+FEAT_CRYPTO = [
+    "BTC_Ret", "BTC_Ret_20d", "BTC_Vol_20d",
+    "ETH_Ret",
+    "Crypto_Risk_Appetite",
+]
+
+# ── NEW Group 18: International Markets (16) ─────────────────────────
+FEAT_INTERNATIONAL = [
+    "EM_Ret", "EM_Ret_20d",
+    "EAFE_Ret", "EAFE_Ret_20d",
+    "China_Ret", "China_Ret_20d",
+    "Japan_Ret", "Japan_Ret_20d",
+    "Brazil_Ret", "Brazil_Ret_20d",
+    "India_Ret", "India_Ret_20d",
+    "Europe_Ret", "Europe_Ret_20d",
+    "US_vs_Intl",
+    "EM_vs_DM",
+]
+
+# ── NEW Group 19: Volatility Structure (6) ───────────────────────────
+FEAT_VOLATILITY = [
+    "VIX_Level", "VIX_Change_5d", "VIX_ZScore",
+    "VIX_RealizedVol_Gap",
+    "VXN_Level",
+    "VIX_VXN_Spread",
+]
+
+# ── NEW Group 20: Market Breadth & Structure (10) ────────────────────
+FEAT_BREADTH = [
+    "SP500_Ret", "SP500_Ret_20d",
+    "NASDAQ_Ret", "NASDAQ_Ret_20d",
+    "DOW_Ret", "DOW_Ret_20d",
+    "RUSSELL2000_Ret", "RUSSELL2000_Ret_20d",
+    "LargeCap_vs_SmallCap",
+    "Narrow_vs_Broad",
+]
+
+# ── NEW Group 21: Calendar Features (5) ──────────────────────────────
+FEAT_CALENDAR = [
+    "DayOfWeek",
+    "MonthOfYear",
+    "QuarterOfYear",
+    "IsMonthEnd",
+    "DaysToExpiry",          # options expiry proximity (3rd Friday)
+]
+
+# ── NEW Group 22: World Bank Macro Fundamentals (5) ──────────────────
+FEAT_WORLDBANK = [
+    "WB_GDP_Growth",
+    "WB_Inflation",
+    "WB_Unemployment",
+    "WB_Trade_GDP",
+    "WB_Gov_Debt_GDP",
+]
+
+# Full V2 feature list (de-duplicated, preserving order)
+# Some groups share column names (e.g. Gold_Ret in FEAT_SECTOR & FEAT_COMMODITIES).
+# dict.fromkeys removes duplicates while keeping first-seen order.
+_ALL_FEATURE_GROUPS = (
+    FEAT_OHLCV                # 5
+    + FEAT_TECH_CLASSIC       # 8
+    + FEAT_ENGINEERED         # 3
+    + FEAT_TECH_ADV           # 9
+    + FEAT_LAG                # 6
+    + FEAT_MACRO              # 9
+    + FEAT_FOMC               # 3
+    + FEAT_MARKET             # 5
+    + FEAT_SECTOR             # 4
+    + FEAT_SENTIMENT          # 4
+    + FEAT_REGIME_PROXY       # 3
+    + FEAT_YIELD_CURVE        # 8
+    + FEAT_CREDIT             # 4
+    + FEAT_SECTOR_ROTATION    # 26
+    + FEAT_COMMODITIES        # 14
+    + FEAT_CURRENCIES         # 11
+    + FEAT_CRYPTO             # 5
+    + FEAT_INTERNATIONAL      # 16
+    + FEAT_VOLATILITY         # 6
+    + FEAT_BREADTH            # 10
+    + FEAT_CALENDAR           # 5
+    + FEAT_WORLDBANK          # 5
+)
+V2_FEATURE_COLS = list(dict.fromkeys(_ALL_FEATURE_GROUPS))  # ~164 unique
+
+N_FEATURES = len(V2_FEATURE_COLS)
 
 # ═══════════════════════════════════════════════════════════════════════
 # Calibration
 # ═══════════════════════════════════════════════════════════════════════
 CALIBRATION_METHODS = ["isotonic", "platt"]
-RELIABILITY_BINS = 10
+RELIABILITY_BINS = 15
 
 # ═══════════════════════════════════════════════════════════════════════
 # Reproducibility
@@ -238,18 +368,28 @@ RELIABILITY_BINS = 10
 SEED = 42
 
 # ═══════════════════════════════════════════════════════════════════════
-# Data augmentation
+# Data augmentation (more aggressive for larger model)
 # ═══════════════════════════════════════════════════════════════════════
-AUGMENT_NOISE_STD   = 0.002
-AUGMENT_SCALE_JITTER = 0.015
+AUGMENT_NOISE_STD    = 0.003
+AUGMENT_SCALE_JITTER = 0.02
+AUGMENT_TIME_WARP    = 0.01      # slight temporal warping
+AUGMENT_MIXUP_ALPHA  = 0.2       # mixup regularization
 
 # ═══════════════════════════════════════════════════════════════════════
 # Time-weighted training (year → weight)
 # ═══════════════════════════════════════════════════════════════════════
 TIME_WEIGHT_MAP = {
+    2026: 1.0,
+    2025: 1.0,
     2024: 1.0,
-    2020: 0.8,
-    2015: 0.5,
-    2008: 0.3,
-    0:    0.2,
+    2023: 0.95,
+    2022: 0.90,
+    2021: 0.85,
+    2020: 0.80,
+    2019: 0.70,
+    2018: 0.60,
+    2015: 0.50,
+    2010: 0.40,
+    2008: 0.35,      # GFC — rare but educational
+    0:    0.25,
 }

@@ -1,13 +1,15 @@
 """
 ViziGenesis V2 — Unified Feature Engineering
 ===============================================
-Produces 59 features from raw OHLCV + macro + sentiment + regime proxies.
+Produces 157 features from raw OHLCV + macro + 60+ open market data sources.
 
-Feature groups:
+Feature groups (22 groups, 157 total):
   OHLCV (5) + Classic TA (8) + Engineered (3) + Advanced TA (9) +
-  Lag Returns (6) + FRED Macro (9) + FOMC Policy (3) +
-  Market Context (5) + Sector/Commodity (4) + Sentiment (4) +
-  Regime Proxies (3) = 59 total
+  Lag Returns (6) + Macro (9) + FOMC (3) + Market (5) + Sector Legacy (4) +
+  Sentiment (4) + Regime Proxies (3) + Yield Curve (8) + Credit (4) +
+  Sector Rotation (26) + Commodities (14) + Currencies (11) + Crypto (5) +
+  International (16) + Volatility (6) + Breadth (10) + Calendar (5) +
+  World Bank (5)
 
 All features are NaN-safe, forward-filled, and optionally z-score normalised.
 """
@@ -19,8 +21,12 @@ import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
 
 from backend.v2.config import (
-    V2_FEATURE_COLS, FEAT_FRED, FEAT_FOMC, FEAT_MARKET,
+    V2_FEATURE_COLS, FEAT_FRED, FEAT_MACRO, FEAT_FOMC, FEAT_MARKET,
     FEAT_SECTOR, FEAT_SENTIMENT, FEAT_REGIME_PROXY,
+    FEAT_YIELD_CURVE, FEAT_CREDIT, FEAT_SECTOR_ROTATION,
+    FEAT_COMMODITIES, FEAT_CURRENCIES, FEAT_CRYPTO,
+    FEAT_INTERNATIONAL, FEAT_VOLATILITY, FEAT_BREADTH,
+    FEAT_CALENDAR, FEAT_WORLDBANK,
     HORIZONS, SEQ_LEN, N_REGIMES,
 )
 
@@ -233,6 +239,118 @@ def add_regime_proxy_features(stock_df: pd.DataFrame, mkt_df: pd.DataFrame) -> p
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 2b. Merge NEW extended feature groups
+# ═══════════════════════════════════════════════════════════════════════
+
+def _merge_feature_group(stock_df: pd.DataFrame, source_df: pd.DataFrame, feature_list: List[str]) -> pd.DataFrame:
+    """Generic merge: left-join source features onto stock DataFrame."""
+    if source_df.empty:
+        for col in feature_list:
+            if col not in stock_df.columns:
+                stock_df[col] = 0.0
+        return stock_df
+    for col in feature_list:
+        if col in source_df.columns:
+            stock_df[col] = source_df[col].reindex(stock_df.index).ffill().bfill().fillna(0)
+        elif col not in stock_df.columns:
+            stock_df[col] = 0.0
+    return stock_df
+
+
+def merge_yield_curve_features(stock_df: pd.DataFrame, yield_df: pd.DataFrame) -> pd.DataFrame:
+    return _merge_feature_group(stock_df, yield_df, FEAT_YIELD_CURVE)
+
+
+def merge_credit_features(stock_df: pd.DataFrame, credit_df: pd.DataFrame) -> pd.DataFrame:
+    return _merge_feature_group(stock_df, credit_df, FEAT_CREDIT)
+
+
+def merge_sector_rotation_features(stock_df: pd.DataFrame, sector_df: pd.DataFrame) -> pd.DataFrame:
+    return _merge_feature_group(stock_df, sector_df, FEAT_SECTOR_ROTATION)
+
+
+def merge_commodity_features(stock_df: pd.DataFrame, commodity_df: pd.DataFrame) -> pd.DataFrame:
+    return _merge_feature_group(stock_df, commodity_df, FEAT_COMMODITIES)
+
+
+def merge_currency_features(stock_df: pd.DataFrame, currency_df: pd.DataFrame) -> pd.DataFrame:
+    return _merge_feature_group(stock_df, currency_df, FEAT_CURRENCIES)
+
+
+def merge_crypto_features(stock_df: pd.DataFrame, crypto_df: pd.DataFrame) -> pd.DataFrame:
+    return _merge_feature_group(stock_df, crypto_df, FEAT_CRYPTO)
+
+
+def merge_international_features(stock_df: pd.DataFrame, intl_df: pd.DataFrame) -> pd.DataFrame:
+    return _merge_feature_group(stock_df, intl_df, FEAT_INTERNATIONAL)
+
+
+def merge_volatility_features(stock_df: pd.DataFrame, vol_df: pd.DataFrame) -> pd.DataFrame:
+    return _merge_feature_group(stock_df, vol_df, FEAT_VOLATILITY)
+
+
+def merge_breadth_features(stock_df: pd.DataFrame, breadth_df: pd.DataFrame) -> pd.DataFrame:
+    return _merge_feature_group(stock_df, breadth_df, FEAT_BREADTH)
+
+
+def merge_worldbank_features(stock_df: pd.DataFrame, wb_df: pd.DataFrame) -> pd.DataFrame:
+    """Merge World Bank macro fundamentals."""
+    wb_col_map = {
+        "GDP_GROWTH": "WB_GDP_Growth",
+        "INFLATION": "WB_Inflation",
+        "UNEMPLOYMENT": "WB_Unemployment",
+        "TRADE_PCT_GDP": "WB_Trade_GDP",
+        "GOV_DEBT_GDP": "WB_Gov_Debt_GDP",
+    }
+    if wb_df.empty:
+        for col in FEAT_WORLDBANK:
+            if col not in stock_df.columns:
+                stock_df[col] = 0.0
+        return stock_df
+    for src_col, feat_col in wb_col_map.items():
+        if src_col in wb_df.columns:
+            stock_df[feat_col] = wb_df[src_col].reindex(stock_df.index).ffill().bfill().fillna(0)
+        elif feat_col not in stock_df.columns:
+            stock_df[feat_col] = 0.0
+    # Fill any remaining
+    for col in FEAT_WORLDBANK:
+        if col not in stock_df.columns:
+            stock_df[col] = 0.0
+    return stock_df
+
+
+def add_calendar_features(stock_df: pd.DataFrame) -> pd.DataFrame:
+    """Add calendar/seasonal features: day of week, month, quarter, month-end, options expiry."""
+    idx = stock_df.index
+    stock_df["DayOfWeek"] = idx.dayofweek / 4.0  # normalized 0-1
+    stock_df["MonthOfYear"] = idx.month / 12.0
+    stock_df["QuarterOfYear"] = idx.quarter / 4.0
+    stock_df["IsMonthEnd"] = idx.is_month_end.astype(float)
+
+    # Options expiry proximity (3rd Friday of each month)
+    days_to_expiry = np.zeros(len(idx), dtype=np.float32)
+    for i, dt in enumerate(idx):
+        # Find 3rd Friday of this month
+        first_day = dt.replace(day=1)
+        # Day of week: 0=Mon, 4=Fri
+        first_friday = first_day + pd.Timedelta(days=(4 - first_day.weekday()) % 7)
+        third_friday = first_friday + pd.Timedelta(days=14)
+        delta = (third_friday - dt).days
+        if delta < 0:
+            # Already past this month's expiry, look at next month
+            next_month = (dt.month % 12) + 1
+            next_year = dt.year + (1 if next_month == 1 else 0)
+            first_day_next = dt.replace(year=next_year, month=next_month, day=1)
+            first_friday_next = first_day_next + pd.Timedelta(days=(4 - first_day_next.weekday()) % 7)
+            third_friday = first_friday_next + pd.Timedelta(days=14)
+            delta = (third_friday - dt).days
+        days_to_expiry[i] = max(delta, 0) / 30.0  # normalized
+
+    stock_df["DaysToExpiry"] = days_to_expiry
+    return stock_df
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 3.  Rolling z-score normalization
 # ═══════════════════════════════════════════════════════════════════════
 def rolling_zscore(df: pd.DataFrame, window: int = 60, clip: float = 5.0) -> pd.DataFrame:
@@ -404,10 +522,21 @@ def build_full_features(
     sector_df: pd.DataFrame,
     sentiment_df: pd.DataFrame,
     feature_cols: Optional[List[str]] = None,
+    # New extended data sources (optional for backward compat)
+    yield_curve_df: Optional[pd.DataFrame] = None,
+    credit_df: Optional[pd.DataFrame] = None,
+    sector_rotation_df: Optional[pd.DataFrame] = None,
+    commodity_df: Optional[pd.DataFrame] = None,
+    currency_df: Optional[pd.DataFrame] = None,
+    crypto_df: Optional[pd.DataFrame] = None,
+    international_df: Optional[pd.DataFrame] = None,
+    volatility_df: Optional[pd.DataFrame] = None,
+    breadth_df: Optional[pd.DataFrame] = None,
+    worldbank_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
-    Full feature pipeline: add TA, merge all external sources, ensure all
-    V2_FEATURE_COLS are present and NaN-free.
+    Full feature pipeline: add TA, merge all external sources (legacy + extended),
+    add calendar features, ensure all V2_FEATURE_COLS are present and NaN-free.
     """
     if feature_cols is None:
         feature_cols = V2_FEATURE_COLS
@@ -415,13 +544,28 @@ def build_full_features(
     # Technical indicators
     df = add_technical_indicators(stock_df)
 
-    # Merge external
+    # Legacy merges (backward compat)
     df = merge_fred_features(df, fred_df)
     df = merge_fomc_features(df, fomc_df)
     df = merge_market_context(df, market_df)
     df = merge_sector_features(df, sector_df)
     df = merge_sentiment_features(df, sentiment_df)
     df = add_regime_proxy_features(df, market_df)
+
+    # New extended merges
+    df = merge_yield_curve_features(df, yield_curve_df if yield_curve_df is not None else pd.DataFrame())
+    df = merge_credit_features(df, credit_df if credit_df is not None else pd.DataFrame())
+    df = merge_sector_rotation_features(df, sector_rotation_df if sector_rotation_df is not None else pd.DataFrame())
+    df = merge_commodity_features(df, commodity_df if commodity_df is not None else pd.DataFrame())
+    df = merge_currency_features(df, currency_df if currency_df is not None else pd.DataFrame())
+    df = merge_crypto_features(df, crypto_df if crypto_df is not None else pd.DataFrame())
+    df = merge_international_features(df, international_df if international_df is not None else pd.DataFrame())
+    df = merge_volatility_features(df, volatility_df if volatility_df is not None else pd.DataFrame())
+    df = merge_breadth_features(df, breadth_df if breadth_df is not None else pd.DataFrame())
+    df = merge_worldbank_features(df, worldbank_df if worldbank_df is not None else pd.DataFrame())
+
+    # Calendar features
+    df = add_calendar_features(df)
 
     # Ensure all feature columns exist
     for col in feature_cols:

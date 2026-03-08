@@ -1,31 +1,55 @@
 """
 Macro-economic data fetching for enhanced AI training.
 
-Primary source for core macro features is FRED series IDs:
-    - SP500
-    - NASDAQCOM
-    - VIXCLS
-    - GS10
-
-If FRED is unavailable for a series, this module falls back to Yahoo Finance
-tickers for that specific feature.
+Primary source for core macro features is World Bank Data360 API.
+If Data360 is unavailable for a series, this module falls back to Yahoo
+Finance tickers for that specific feature.
 """
 import logging
+import json
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger("vizigenesis.macro")
 
-# ── Core macro series (FRED first, Yahoo fallback) ───────────────────
-MACRO_FRED_SERIES: Dict[str, str] = {
-    "SP500": "SP500",          # S&P 500 index level
-    "NASDAQ": "NASDAQCOM",     # NASDAQ Composite
-    "VIX": "VIXCLS",           # CBOE Volatility Index close
-    "BOND_10Y": "GS10",        # 10-Year Treasury Constant Maturity Rate
+# ── Core macro series (Data360 first, Yahoo fallback) ────────────────
+DATA360_API_ROOT = "https://data360api.worldbank.org"
+
+MACRO_WB_SERIES: Dict[str, Dict[str, str]] = {
+    # Data360 currently has limited direct US market index levels.
+    # We use the closest available indicators as primary source.
+    "SP500": {
+        "DATABASE_ID": "WB_FSI",
+        "INDICATOR": "WB_FSI_CM_MKT_INDX_ZG",
+        "REF_AREA": "USA",
+        "FREQ": "A",
+        "VALUE_TYPE": "pct",
+    },
+    "NASDAQ": {
+        "DATABASE_ID": "IMF_IFS",
+        "INDICATOR": "IMF_IFS_FPEPNAS",
+        "REF_AREA": "USA",
+        "VALUE_TYPE": "level",
+    },
+    "VIX": {
+        "DATABASE_ID": "WB_WDI",
+        "INDICATOR": "WB_WDI_FR_INR_RISK",
+        "REF_AREA": "USA",
+        "FREQ": "A",
+        "VALUE_TYPE": "pct",
+    },
+    "BOND_10Y": {
+        "DATABASE_ID": "IMF_IFS",
+        "INDICATOR": "IMF_IFS_FIGBY_MT",
+        "REF_AREA": "USA",
+        "VALUE_TYPE": "level",
+    },
 }
 
 MACRO_YAHOO_FALLBACK: Dict[str, str] = {
@@ -100,33 +124,97 @@ def _period_to_start(period: str) -> str:
     return start.isoformat()
 
 
-def _fetch_fred_series(series_id: str, period: str = "10y") -> Optional[pd.Series]:
-    """
-    Fetch a FRED series by series_id using CSV endpoint.
-    This endpoint works without FRED_API_KEY for public series.
-    """
+def _parse_time_period(raw: str) -> Optional[pd.Timestamp]:
+    """Parse Data360 TIME_PERIOD values like YYYY, YYYY-MM, YYYY-Qn."""
+    if not raw:
+        return None
+    text = str(raw).strip()
+    try:
+        if len(text) == 4 and text.isdigit():
+            return pd.Timestamp(f"{text}-01-01")
+        if "-Q" in text:
+            year, quarter = text.split("-Q", 1)
+            q = int(quarter)
+            month = min(max((q - 1) * 3 + 1, 1), 12)
+            return pd.Timestamp(f"{year}-{month:02d}-01")
+        return pd.to_datetime(text, errors="coerce")
+    except Exception:
+        return None
+
+
+def _fetch_worldbank_series(series_cfg: Dict[str, str], period: str = "10y") -> Optional[pd.Series]:
+    """Fetch a single Data360 indicator series as date-indexed float values."""
     start = _period_to_start(period)
-    # Keep end date open to include latest value.
-    url = (
-        "https://fred.stlouisfed.org/graph/fredgraph.csv"
-        f"?id={series_id}&cosd={start}"
-    )
+    params = {
+        "DATABASE_ID": series_cfg.get("DATABASE_ID", ""),
+        "INDICATOR": series_cfg.get("INDICATOR", ""),
+        "REF_AREA": series_cfg.get("REF_AREA", ""),
+        "timePeriodFrom": start,
+        "format": "json",
+        "top": 1000,
+        "skip": 0,
+    }
+    if series_cfg.get("FREQ"):
+        params["FREQ"] = series_cfg["FREQ"]
+
+    obs_dates: List[pd.Timestamp] = []
+    obs_values: List[float] = []
+    expected_count: Optional[int] = None
+
     for attempt in range(2):
         try:
-            df = pd.read_csv(url)
-            if df is None or df.empty:
-                continue
-            if "DATE" not in df.columns or series_id not in df.columns:
-                continue
-            series = pd.to_numeric(df[series_id], errors="coerce")
-            idx = pd.to_datetime(df["DATE"], errors="coerce")
-            out = pd.Series(series.values, index=idx).dropna()
-            out = out[~out.index.isna()]
-            if len(out) > 0:
-                out.name = series_id
-                return out.sort_index()
+            while True:
+                qs = urlencode(params)
+                req = Request(f"{DATA360_API_ROOT}/data360/data?{qs}", headers={"User-Agent": "ViziGenesis/2.0"})
+                with urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+
+                if not isinstance(data, dict):
+                    break
+
+                if expected_count is None:
+                    try:
+                        expected_count = int(data.get("count", 0))
+                    except Exception:
+                        expected_count = 0
+
+                values = data.get("value", [])
+                if not isinstance(values, list) or not values:
+                    break
+
+                for row in values:
+                    if not isinstance(row, dict):
+                        continue
+                    tp = _parse_time_period(str(row.get("TIME_PERIOD", "")))
+                    try:
+                        ov = float(row.get("OBS_VALUE"))
+                    except Exception:
+                        continue
+                    if tp is None:
+                        continue
+                    obs_dates.append(tp)
+                    obs_values.append(ov)
+
+                params["skip"] = int(params.get("skip", 0)) + int(params.get("top", 1000))
+                if len(values) < int(params.get("top", 1000)):
+                    break
+                if expected_count is not None and int(params["skip"]) >= expected_count:
+                    break
+
+            if obs_dates and obs_values:
+                s = pd.Series(obs_values, index=pd.DatetimeIndex(obs_dates), name=series_cfg.get("INDICATOR", ""))
+                s = s[~s.index.duplicated(keep="last")].sort_index().dropna()
+                if len(s) > 0:
+                    return s
+            return None
         except Exception as e:
-            logger.debug("FRED fetch attempt %d for %s failed: %s", attempt + 1, series_id, e)
+            logger.debug(
+                "Data360 fetch attempt %d for %s/%s failed: %s",
+                attempt + 1,
+                series_cfg.get("DATABASE_ID", ""),
+                series_cfg.get("INDICATOR", ""),
+                e,
+            )
             time.sleep(0.5)
     return None
 
@@ -151,13 +239,21 @@ def fetch_macro_data(period: str = "10y") -> pd.DataFrame:
         if time.time() - _macro_cache_ts.get(cache_key, 0) < _MACRO_CACHE_TTL:
             return _macro_cache[cache_key].copy()
 
-    # Fetch each macro series from FRED first, then fallback to Yahoo when needed.
+    # Fetch each macro series from Data360 first, then fallback to Yahoo.
     frames: Dict[str, pd.Series] = {}
-    for name, fred_series_id in MACRO_FRED_SERIES.items():
-        series = _fetch_fred_series(fred_series_id, period)
+    wb_value_type: Dict[str, str] = {}
+    for name, series_cfg in MACRO_WB_SERIES.items():
+        series = _fetch_worldbank_series(series_cfg, period)
         if series is not None and len(series) > 0:
             frames[name] = series
-            logger.info("Macro %s (FRED:%s): %d rows", name, fred_series_id, len(series))
+            wb_value_type[name] = series_cfg.get("VALUE_TYPE", "level")
+            logger.info(
+                "Macro %s (Data360:%s/%s): %d rows",
+                name,
+                series_cfg.get("DATABASE_ID", ""),
+                series_cfg.get("INDICATOR", ""),
+                len(series),
+            )
             continue
 
         yahoo_ticker = MACRO_YAHOO_FALLBACK.get(name, "")
@@ -166,15 +262,21 @@ def fetch_macro_data(period: str = "10y") -> pd.DataFrame:
             if series is not None and len(series) > 0:
                 frames[name] = series
                 logger.warning(
-                    "Macro %s FRED unavailable (%s) — fallback Yahoo (%s): %d rows",
+                    "Macro %s Data360 unavailable (%s/%s) — fallback Yahoo (%s): %d rows",
                     name,
-                    fred_series_id,
+                    series_cfg.get("DATABASE_ID", ""),
+                    series_cfg.get("INDICATOR", ""),
                     yahoo_ticker,
                     len(series),
                 )
                 continue
 
-        logger.warning("Macro %s (FRED:%s): unavailable", name, fred_series_id)
+        logger.warning(
+            "Macro %s (Data360:%s/%s): unavailable",
+            name,
+            series_cfg.get("DATABASE_ID", ""),
+            series_cfg.get("INDICATOR", ""),
+        )
 
     # DXY (Dollar Index) for inflation proxy
     dxy_series = _fetch_single_close(_DXY_TICKER, period)
@@ -194,13 +296,17 @@ def fetch_macro_data(period: str = "10y") -> pd.DataFrame:
     # ── Transform to training-friendly features ──────────────────────
     macro = pd.DataFrame(index=raw_df.index)
 
-    # SP500 & NASDAQ → daily % return (bounded to ±15 %)
+    # SP500 & NASDAQ → daily % return (bounded to +-15 %).
+    # If Data360 already returns percent values, use them directly.
     for col in ("SP500", "NASDAQ"):
         if col in raw_df.columns:
-            ret = raw_df[col].pct_change(fill_method=None).fillna(0) * 100
+            if wb_value_type.get(col) == "pct":
+                ret = pd.to_numeric(raw_df[col], errors="coerce").ffill().fillna(0)
+            else:
+                ret = raw_df[col].pct_change(fill_method=None).fillna(0) * 100
             macro[col] = ret.clip(-15, 15)
 
-    # VIX → raw level (already 0–100 scale)
+    # VIX proxy from Data360 (or Yahoo fallback).
     if "VIX" in raw_df.columns:
         macro["VIX"] = raw_df["VIX"].ffill()
 

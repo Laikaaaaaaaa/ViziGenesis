@@ -6,10 +6,12 @@ panel dataset for cross-stock training.
 
 Features:
   • Downloads max history for each ticker (Yahoo Finance)
-  • Builds 59-feature representation per stock per day
+  • Builds 157-feature representation per stock per day
+  • Pulls from 60+ open market data sources (macro, bonds, sectors,
+    commodities, currencies, crypto, international markets)
   • Attaches stock-level identifiers for learned embeddings
   • Stacks into unified (N_total_samples, seq_len, n_features) tensor
-  • Supports incremental updates and caching
+  • Targets millions of rows across 25 liquid US stocks
 """
 import logging, os, json, time, hashlib
 from typing import Dict, List, Optional, Tuple
@@ -88,9 +90,10 @@ def build_panel_dataset(
         build_full_features, generate_targets, generate_regime_labels,
         prepare_panel_sequences,
     )
-    from backend.v2.fred_data import (
-        fetch_fred_macro, build_fomc_features,
+    from backend.v2.market_data import (
+        fetch_macro_data, build_fomc_features,
         fetch_market_context, fetch_sector_commodity, fetch_nasdaq_close,
+        fetch_all_market_data,
     )
     from backend.v2.sentiment import build_sentiment_features
     from backend.v2.regime import detect_regime
@@ -103,15 +106,43 @@ def build_panel_dataset(
     np.random.seed(SEED)
 
     # ── Fetch shared macro / context data (once for all stocks) ────────
-    logger.info("Fetching shared macro data...")
-    fred_df = fetch_fred_macro(start="2000-01-01")
-    market_df = fetch_market_context(start="2000-01-01")
+    logger.info("Fetching comprehensive market data from 60+ sources...")
+    all_data = fetch_all_market_data(start="2000-01-01")
+
+    fred_df = all_data["macro_compat"]
+    market_df = all_data.get("bulk_close", pd.DataFrame())
+    # Build market context from bulk if not empty
+    market_ctx = fetch_market_context(start="2000-01-01")
     sector_df = fetch_sector_commodity(start="2000-01-01")
-    fomc_df = build_fomc_features(market_df.index) if not market_df.empty else pd.DataFrame()
+    fomc_df = all_data.get("fomc", pd.DataFrame())
+    if fomc_df.empty and not market_ctx.empty:
+        fomc_df = build_fomc_features(market_ctx.index)
     nasdaq_close = fetch_nasdaq_close(start="2000-01-01")
 
+    # Extended data sources
+    yield_curve_df = all_data.get("yield_curve", pd.DataFrame())
+    credit_df = all_data.get("credit", pd.DataFrame())
+    sector_rotation_df = all_data.get("sectors", pd.DataFrame())
+    commodity_df = all_data.get("commodities", pd.DataFrame())
+    currency_df = all_data.get("currencies", pd.DataFrame())
+    crypto_df = all_data.get("crypto", pd.DataFrame())
+    international_df = all_data.get("international", pd.DataFrame())
+    volatility_df = all_data.get("volatility", pd.DataFrame())
+    breadth_df = all_data.get("breadth", pd.DataFrame())
+    worldbank_df = all_data.get("worldbank", pd.DataFrame())
+
+    logger.info(
+        "Market data loaded: macro=%d rows, yield_curve=%d, credit=%d, "
+        "sectors=%d, commodities=%d, currencies=%d, crypto=%d, intl=%d, "
+        "volatility=%d, breadth=%d, worldbank=%d",
+        len(fred_df), len(yield_curve_df), len(credit_df),
+        len(sector_rotation_df), len(commodity_df), len(currency_df),
+        len(crypto_df), len(international_df), len(volatility_df),
+        len(breadth_df), len(worldbank_df),
+    )
+
     # VIX for regime detection
-    vix = market_df["VIX"] if "VIX" in market_df.columns else None
+    vix = market_ctx["VIX"] if "VIX" in market_ctx.columns else None
 
     # ── Process each stock ─────────────────────────────────────────────
     all_X, all_dir, all_ret, all_regime, all_stock_ids, all_dates = [], [], [], [], [], []
@@ -132,10 +163,20 @@ def build_panel_dataset(
             continue
 
         # Build features
-        sentiment_df = build_sentiment_features(stock_df, market_df, symbol=ticker)
+        sentiment_df = build_sentiment_features(stock_df, market_ctx, symbol=ticker)
         features_df = build_full_features(
-            stock_df, fred_df, fomc_df, market_df, sector_df, sentiment_df,
+            stock_df, fred_df, fomc_df, market_ctx, sector_df, sentiment_df,
             feature_cols=feature_cols,
+            yield_curve_df=yield_curve_df,
+            credit_df=credit_df,
+            sector_rotation_df=sector_rotation_df,
+            commodity_df=commodity_df,
+            currency_df=currency_df,
+            crypto_df=crypto_df,
+            international_df=international_df,
+            volatility_df=volatility_df,
+            breadth_df=breadth_df,
+            worldbank_df=worldbank_df,
         )
 
         # Generate targets

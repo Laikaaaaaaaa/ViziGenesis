@@ -1,22 +1,25 @@
 """
-ViziGenesis V2 — Hybrid Deep Learning Model
-===============================================
+ViziGenesis V2 — Hybrid Deep Learning Model (RTX 4090 Optimized)
+===================================================================
 Production-grade, multi-head architecture with:
 
-  Shared Encoder
-  ├── Temporal Fusion Transformer (Variable Selection + LSTM + Attention)
-  ├── Bidirectional LSTM branch
-  └── GRU branch with skip connections
+  Shared Encoder (384-dim, 12 heads, 6 layers)
+  ├── Temporal Fusion Transformer (Variable Selection + LSTM + Cross-Attention)
+  ├── Bidirectional LSTM branch with temporal attention pooling
+  ├── GRU branch with skip connections
+  └── Transformer Encoder branch (pure self-attention)
 
-  Output Heads
+  Output Heads (6 heads, multi-task learning)
   ├── Direction head   (binary classification — UP/DOWN)
   ├── Return heads     (regression — 1d, 5d, 30d)
   ├── Excess return    (regression — vs benchmark)
   └── Regime head      (3-class classification — bull/bear/sideways)
 
-  Meta-gating: learned attention weights combine branch outputs.
+  Meta-gating: learned attention weights combine 4 branch outputs.
+  Positional Encoding: sinusoidal + learned for 120-day sequences.
+  Feature Groups: 157 features from 60+ open data sources.
 
-Parameters: ~ 3-5M depending on d_model.
+Parameters: ~ 15-25M (RTX 4090 24GB).
 """
 import logging, os, json, math
 from datetime import datetime
@@ -33,7 +36,7 @@ from backend.v2.config import (
     DEVICE, USE_AMP, D_MODEL, N_HEADS, N_LAYERS, DROPOUT,
     N_FEATURES, N_REGIMES, SEQ_LEN, SEED,
     LEARNING_RATE, WEIGHT_DECAY, BATCH_SIZE, MAX_EPOCHS,
-    PATIENCE, GRAD_CLIP,
+    PATIENCE, GRAD_CLIP, GRAD_ACCUM_STEPS,
     LOSS_W_DIRECTION, LOSS_W_RET_1D, LOSS_W_RET_5D,
     LOSS_W_RET_30D, LOSS_W_EXCESS, LOSS_W_REGIME,
     AUGMENT_NOISE_STD, AUGMENT_SCALE_JITTER,
@@ -190,14 +193,62 @@ class GRUBranch(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# NEW: Positional Encoding for Transformer branch
+# ═══════════════════════════════════════════════════════════════════════
+class SinusoidalPositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding + learned offset."""
+    def __init__(self, d_model: int, max_len: int = 500, dropout: float = 0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
+        self.register_buffer("pe", pe)
+        self.learned_offset = nn.Parameter(torch.zeros(1, 1, d_model))
+
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1), :] + self.learned_offset
+        return self.dropout(x)
+
+
+class TransformerBranch(nn.Module):
+    """Pure Transformer encoder branch with sinusoidal positional encoding."""
+    def __init__(self, n_features: int, d_model: int, n_heads: int, n_layers: int, dropout: float):
+        super().__init__()
+        self.proj = nn.Linear(n_features, d_model)
+        self.pos_enc = SinusoidalPositionalEncoding(d_model, max_len=500, dropout=dropout)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=d_model * 4,
+            dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=max(n_layers // 2, 2))
+        self.pool_attn = nn.Linear(d_model, 1)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        h = self.proj(x)                       # (B, T, d_model)
+        h = self.pos_enc(h)                    # add positional encoding
+        h = self.encoder(h)                    # (B, T, d_model)
+        # Attention pooling over time
+        attn_w = torch.softmax(self.pool_attn(h), dim=1)  # (B, T, 1)
+        pooled = (h * attn_w).sum(dim=1)       # (B, d_model)
+        return self.dropout(self.norm(pooled))
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Main Hybrid Model
 # ═══════════════════════════════════════════════════════════════════════
 class HybridForecaster(nn.Module):
     """
     Production hybrid model with:
-      • 3 branches (TFT, BiLSTM, GRU)
+      • 4 branches (TFT, BiLSTM, GRU, Transformer)
       • Learned meta-gating for branch combination
       • 6 output heads: direction, 3× return, excess, regime
+      • ~15-25M params optimized for RTX 4090
     """
     def __init__(
         self,
@@ -207,94 +258,101 @@ class HybridForecaster(nn.Module):
         n_layers: int = N_LAYERS,
         dropout: float = DROPOUT,
         n_regimes: int = N_REGIMES,
-        n_stocks: int = 5,
+        n_stocks: int = 25,
     ):
         super().__init__()
         self.n_features = n_features
         self.d_model = d_model
         self.n_stocks = n_stocks
+        self.n_branches = 4
 
         # ── Optional stock embedding ──────────────────────────────────
         self.stock_emb = nn.Embedding(max(n_stocks, 1), d_model // 8)
 
-        # ── Branches ──────────────────────────────────────────────────
+        # ── Branches (4 parallel pathways) ────────────────────────────
         self.tft = TFTBranch(n_features, d_model, n_heads, n_layers, dropout)
         self.bilstm = BiLSTMBranch(n_features, d_model, n_layers, dropout)
         self.gru = GRUBranch(n_features, d_model, n_layers, dropout)
+        self.transformer = TransformerBranch(n_features, d_model, n_heads, n_layers, dropout)
 
-        # ── Meta-gating: learned weights to combine branches ──────────
-        gate_input_dim = d_model * 3  # concat of 3 branch outputs
+        # ── Meta-gating: learned weights to combine 4 branches ────────
+        gate_input_dim = d_model * self.n_branches
         self.meta_gate = nn.Sequential(
             nn.Linear(gate_input_dim, d_model),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model, 3),
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, self.n_branches),
             nn.Softmax(dim=-1),
         )
 
-        # ── Output heads ─────────────────────────────────────────────
+        head_input_dim = d_model + d_model // 8
+
+        # ── Output heads (deeper for better representation) ───────────
         # Direction (binary classification)
         self.head_direction = nn.Sequential(
-            nn.Linear(d_model + d_model // 8, d_model // 2),
-            nn.ReLU(),
+            nn.Linear(head_input_dim, d_model),
+            nn.GELU(),
             nn.Dropout(dropout),
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
             nn.Linear(d_model // 2, 1),
             nn.Sigmoid(),
         )
 
-        # Return regression heads  (1d, 5d, 30d)
-        self.head_ret_1d = nn.Sequential(
-            nn.Linear(d_model + d_model // 8, d_model // 2),
-            nn.ReLU(),
-            nn.Linear(d_model // 2, 1),
-        )
-        self.head_ret_5d = nn.Sequential(
-            nn.Linear(d_model + d_model // 8, d_model // 2),
-            nn.ReLU(),
-            nn.Linear(d_model // 2, 1),
-        )
-        self.head_ret_30d = nn.Sequential(
-            nn.Linear(d_model + d_model // 8, d_model // 2),
-            nn.ReLU(),
-            nn.Linear(d_model // 2, 1),
-        )
+        # Return regression heads  (1d, 5d, 30d) — deeper
+        def _make_reg_head():
+            return nn.Sequential(
+                nn.Linear(head_input_dim, d_model),
+                nn.GELU(),
+                nn.Dropout(dropout * 0.5),
+                nn.Linear(d_model, d_model // 2),
+                nn.GELU(),
+                nn.Linear(d_model // 2, 1),
+            )
+
+        self.head_ret_1d = _make_reg_head()
+        self.head_ret_5d = _make_reg_head()
+        self.head_ret_30d = _make_reg_head()
 
         # Excess return head
-        self.head_excess = nn.Sequential(
-            nn.Linear(d_model + d_model // 8, d_model // 2),
-            nn.ReLU(),
-            nn.Linear(d_model // 2, 1),
-        )
+        self.head_excess = _make_reg_head()
 
         # Regime classification head
         self.head_regime = nn.Sequential(
-            nn.Linear(d_model + d_model // 8, d_model // 2),
-            nn.ReLU(),
+            nn.Linear(head_input_dim, d_model),
+            nn.GELU(),
             nn.Dropout(dropout),
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
             nn.Linear(d_model // 2, n_regimes),
         )
 
     def forward(self, x, stock_ids=None):
         """
         Args:
-            x: (B, T, N_feat)
+            x: (B, T, N_feat) — 157-feature sequences
             stock_ids: (B,) optional stock indices for embedding
         Returns: dict of head outputs
         """
-        # Run branches
+        # Run 4 branches in parallel
         tft_out, feat_weights = self.tft(x)     # (B, d_model), (B, N_feat)
         bilstm_out = self.bilstm(x)             # (B, d_model)
         gru_out = self.gru(x)                   # (B, d_model)
+        trans_out = self.transformer(x)          # (B, d_model)
 
         # Meta-gating
-        concat = torch.cat([tft_out, bilstm_out, gru_out], dim=-1)  # (B, 3*d_model)
-        gate_weights = self.meta_gate(concat)    # (B, 3)
+        concat = torch.cat([tft_out, bilstm_out, gru_out, trans_out], dim=-1)
+        gate_weights = self.meta_gate(concat)    # (B, 4)
 
         # Weighted combination
         combined = (
             gate_weights[:, 0:1] * tft_out +
             gate_weights[:, 1:2] * bilstm_out +
-            gate_weights[:, 2:3] * gru_out
+            gate_weights[:, 2:3] * gru_out +
+            gate_weights[:, 3:4] * trans_out
         )  # (B, d_model)
 
         # Stock embedding
@@ -303,7 +361,7 @@ class HybridForecaster(nn.Module):
         else:
             stock_emb = torch.zeros(x.size(0), self.d_model // 8, device=x.device)
 
-        h = torch.cat([combined, stock_emb], dim=-1)  # (B, d_model + d_model//8)
+        h = torch.cat([combined, stock_emb], dim=-1)
 
         return {
             "direction": self.head_direction(h),         # (B, 1)
@@ -312,7 +370,7 @@ class HybridForecaster(nn.Module):
             "return_30d": self.head_ret_30d(h),          # (B, 1)
             "excess": self.head_excess(h),               # (B, 1)
             "regime": self.head_regime(h),               # (B, n_regimes)
-            "branch_weights": gate_weights,              # (B, 3)
+            "branch_weights": gate_weights,              # (B, 4)
             "feat_weights": feat_weights,                # (B, N_feat)
         }
 
@@ -437,22 +495,31 @@ def train_hybrid_model(
     train_ds = _make_dataset(X_train, y_dir_train, y_ret_train, y_regime_train, stock_ids_train)
     val_ds = _make_dataset(X_val, y_dir_val, y_ret_val, y_regime_val, stock_ids_val)
 
-    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True, pin_memory=True)
-    val_dl = DataLoader(val_ds, batch_size=batch_size, pin_memory=True)
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True,
+                          pin_memory=True, num_workers=0)
+    val_dl = DataLoader(val_ds, batch_size=batch_size, pin_memory=True, num_workers=0)
 
     history = []
     best_val_loss = float("inf")
     patience_counter = 0
     best_state = None
+    accum_steps = GRAD_ACCUM_STEPS
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info("HybridForecaster: %d parameters, device=%s, AMP=%s", n_params, DEVICE, USE_AMP)
+    logger.info(
+        "HybridForecaster: %d parameters (%.1fM), device=%s, AMP=%s, "
+        "batch=%d×%d=%d effective, 4 branches, %d features",
+        n_params, n_params / 1e6, DEVICE, USE_AMP,
+        batch_size, accum_steps, batch_size * accum_steps, n_features,
+    )
 
     for epoch in range(1, epochs + 1):
-        # ── Training ──────────────────────────────────────────────────
+        # ── Training with gradient accumulation ───────────────────────
         model.train()
         train_losses = []
-        for batch in train_dl:
+        optimizer.zero_grad()
+
+        for step, batch in enumerate(train_dl):
             xb, yb_dir, yb_ret, yb_reg, sb = [t.to(DEVICE) for t in batch]
 
             # Data augmentation
@@ -460,7 +527,6 @@ def train_hybrid_model(
             scale = 1.0 + (torch.rand(xb.size(0), 1, 1, device=DEVICE) * 2 - 1) * AUGMENT_SCALE_JITTER
             xb = xb * scale + noise
 
-            optimizer.zero_grad()
             with autocast(enabled=USE_AMP):
                 preds = model(xb, stock_ids=sb)
                 targets = {
@@ -472,14 +538,18 @@ def train_hybrid_model(
                     "regime": yb_reg,
                 }
                 loss, _ = criterion(preds, targets)
+                loss = loss / accum_steps  # scale for accumulation
 
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-            scaler.step(optimizer)
-            scaler.update()
 
-            train_losses.append(loss.item())
+            if (step + 1) % accum_steps == 0 or (step + 1) == len(train_dl):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+            train_losses.append(loss.item() * accum_steps)  # unscale for logging
 
         scheduler.step()
 

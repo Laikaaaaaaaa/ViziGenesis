@@ -1130,7 +1130,7 @@ def _ensure_v2_imports():
         from backend.v2.backtest import run_backtest as run_v2_backtest, run_stress_tests
         from backend.v2.regime import detect_regime, get_current_regime
         from backend.v2.sentiment import build_sentiment_features
-        from backend.v2.fred_data import fetch_fred_macro
+        from backend.v2.market_data import fetch_fred_macro
 
         _v2_modules = {
             "PILOT_TICKERS": PILOT_TICKERS,

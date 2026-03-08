@@ -219,8 +219,7 @@ Tạo `.env` nếu cần:
 
 ```bash
 cat > .env << EOF
-# FRED API key cho macro data (optional)
-FRED_API_KEY=your_api_key_here
+# Macro data source: World Bank Data360 (no API key required)
 
 # Cache settings
 CACHE_TTL_HISTORY=604800
