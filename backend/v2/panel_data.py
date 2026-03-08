@@ -32,29 +32,44 @@ logger = logging.getLogger("vizigenesis.v2.panel")
 # 1.  Single-stock data fetcher
 # ═══════════════════════════════════════════════════════════════════════
 def fetch_stock_data(symbol: str, period: str = "max") -> pd.DataFrame:
-    """Download OHLCV data for a single stock from Yahoo Finance."""
+    """Download OHLCV data for a single stock from Yahoo Finance.
+
+    Uses ``yf.Ticker().history()`` which is more reliable on cloud
+    servers (RunPod, Colab, etc.) than ``yf.download()``.
+    """
     import yfinance as yf
-    try:
-        df = yf.download(symbol, period=period, progress=False, auto_adjust=True)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.droplevel(1)
-        if df.empty:
-            logger.warning("No data for %s", symbol)
-            return pd.DataFrame()
-        # Ensure standard columns
-        required = ["Open", "High", "Low", "Close", "Volume"]
-        for col in required:
-            if col not in df.columns:
-                logger.warning("Missing column %s for %s", col, symbol)
+    for attempt in range(3):
+        try:
+            t = yf.Ticker(symbol)
+            df = t.history(period=period, auto_adjust=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+            if df.empty:
+                if attempt < 2:
+                    time.sleep(1.0 + attempt)
+                    continue
+                logger.warning("No data for %s", symbol)
                 return pd.DataFrame()
-        df = df[required].dropna()
-        df.index = pd.DatetimeIndex(df.index)
-        logger.info("Fetched %s: %d rows (%s to %s)", symbol, len(df),
-                     df.index[0].date(), df.index[-1].date())
-        return df
-    except Exception as e:
-        logger.error("Failed to fetch %s: %s", symbol, e)
-        return pd.DataFrame()
+            # Normalize tz-aware index (yfinance ≥1.0)
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+            # Ensure standard columns
+            required = ["Open", "High", "Low", "Close", "Volume"]
+            for col in required:
+                if col not in df.columns:
+                    logger.warning("Missing column %s for %s", col, symbol)
+                    return pd.DataFrame()
+            df = df[required].dropna()
+            df.index = pd.DatetimeIndex(df.index)
+            logger.info("Fetched %s: %d rows (%s to %s)", symbol, len(df),
+                         df.index[0].date(), df.index[-1].date())
+            return df
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1.0 + attempt)
+            else:
+                logger.error("Failed to fetch %s: %s", symbol, e)
+    return pd.DataFrame()
 
 
 # ═══════════════════════════════════════════════════════════════════════

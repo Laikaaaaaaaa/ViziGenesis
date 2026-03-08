@@ -137,19 +137,31 @@ YAHOO_TICKERS = {
 }
 
 
-def _yf_download_safe(ticker: str, start: str, retries: int = 2) -> pd.DataFrame:
-    """Download Yahoo Finance data with retries and column normalization."""
+def _yf_download_safe(ticker: str, start: str = "2000-01-01",
+                      period: Optional[str] = None, retries: int = 3) -> pd.DataFrame:
+    """Download Yahoo Finance data with retries.
+
+    Uses ``yf.Ticker().history()`` which is more reliable on cloud
+    servers (RunPod, Colab, etc.) than ``yf.download()``.
+    """
     import yfinance as yf
     for attempt in range(retries + 1):
         try:
-            df = yf.download(ticker, start=start, progress=False, auto_adjust=True)
+            t = yf.Ticker(ticker)
+            if period:
+                df = t.history(period=period, auto_adjust=True)
+            else:
+                df = t.history(start=start, auto_adjust=True)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.droplevel(1)
             if not df.empty:
+                # Normalize tz-aware index to tz-naive (yfinance ≥1.0)
+                if df.index.tz is not None:
+                    df.index = df.index.tz_localize(None)
                 return df
         except Exception as e:
             if attempt < retries:
-                time.sleep(0.5)
+                time.sleep(1.0 + attempt * 0.5)
             else:
                 logger.debug("Yahoo download %s failed: %s", ticker, e)
     return pd.DataFrame()
@@ -161,8 +173,9 @@ def fetch_yahoo_bulk(
     column: str = "Close",
 ) -> pd.DataFrame:
     """
-    Fetch a single column (default: Close) for many Yahoo tickers in parallel.
-    Returns a DataFrame with ticker names as columns, date-indexed.
+    Fetch a single column (default: Close) for many Yahoo tickers.
+    Uses sequential ``Ticker.history()`` calls which are more reliable
+    on cloud servers than multi-ticker ``yf.download()``.
     """
     if tickers is None:
         tickers = YAHOO_TICKERS
@@ -171,50 +184,15 @@ def fetch_yahoo_bulk(
     if cached is not None:
         return cached
 
-    import yfinance as yf
-
-    ticker_list = list(tickers.values())
-    name_list = list(tickers.keys())
-
     frames = {}
-    # Download in batches to avoid API throttling
-    batch_size = 20
-    for i in range(0, len(ticker_list), batch_size):
-        batch_tickers = ticker_list[i:i + batch_size]
-        batch_names = name_list[i:i + batch_size]
-        try:
-            raw = yf.download(
-                batch_tickers, start=start, progress=False,
-                auto_adjust=True, group_by="ticker", threads=True,
-            )
-            if raw.empty:
-                continue
-
-            if len(batch_tickers) == 1:
-                # Single ticker: columns are flat
-                if isinstance(raw.columns, pd.MultiIndex):
-                    raw.columns = raw.columns.droplevel(1)
-                if column in raw.columns:
-                    frames[batch_names[0]] = raw[column]
-            else:
-                for tkr, name in zip(batch_tickers, batch_names):
-                    try:
-                        if isinstance(raw.columns, pd.MultiIndex):
-                            if tkr in raw.columns.get_level_values(0):
-                                col_data = raw[tkr][column]
-                                if not col_data.dropna().empty:
-                                    frames[name] = col_data
-                        elif column in raw.columns:
-                            frames[name] = raw[column]
-                    except Exception:
-                        continue
-        except Exception as e:
-            logger.warning("Yahoo bulk batch %d failed: %s", i // batch_size, e)
-            # Fall back to individual downloads for this batch
-            for tkr, name in zip(batch_tickers, batch_names):
-                df = _yf_download_safe(tkr, start)
-                if not df.empty and column in df.columns:
-                    frames[name] = df[column]
+    total = len(tickers)
+    for idx, (name, tkr) in enumerate(tickers.items()):
+        df = _yf_download_safe(tkr, start=start)
+        if not df.empty and column in df.columns:
+            frames[name] = df[column]
+        # Brief pause every 8 tickers to avoid throttling
+        if (idx + 1) % 8 == 0 and idx + 1 < total:
+            time.sleep(0.3)
 
     if not frames:
         return pd.DataFrame()
@@ -223,6 +201,7 @@ def fetch_yahoo_bulk(
     result.index = pd.DatetimeIndex(result.index)
     result = result.sort_index()
     _set_cache(f"yahoo_bulk_{column}_{start}", result)
+    logger.info("Yahoo bulk fetched: %d/%d tickers OK", len(frames), total)
     return result
 
 
@@ -963,14 +942,10 @@ def fetch_sector_commodity(start: str = "2000-01-01") -> pd.DataFrame:
 
 def fetch_nasdaq_close(start: str = "2000-01-01") -> pd.Series:
     """Return raw NASDAQ close for excess-return computation."""
-    import yfinance as yf
-    try:
-        df = yf.download("^IXIC", start=start, progress=False, auto_adjust=True)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.droplevel(1)
+    df = _yf_download_safe("^IXIC", start=start)
+    if not df.empty and "Close" in df.columns:
         return df["Close"].dropna()
-    except Exception:
-        return pd.Series(dtype=float)
+    return pd.Series(dtype=float)
 
 
 # ═══════════════════════════════════════════════════════════════════════

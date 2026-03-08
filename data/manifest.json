@@ -1,0 +1,23 @@
+{
+  "created_at": "2026-03-08T10:06:21.040873Z",
+  "data_root": "C:\\Users\\abc23\\Desktop\\ViziGenesis\\data",
+  "structure": {
+    "macro": "C:\\Users\\abc23\\Desktop\\ViziGenesis\\data\\macro",
+    "markets": "C:\\Users\\abc23\\Desktop\\ViziGenesis\\data\\markets",
+    "stocks": "C:\\Users\\abc23\\Desktop\\ViziGenesis\\data\\stocks",
+    "fundamentals": "C:\\Users\\abc23\\Desktop\\ViziGenesis\\data\\fundamentals",
+    "news": "C:\\Users\\abc23\\Desktop\\ViziGenesis\\data\\news",
+    "transcripts": "C:\\Users\\abc23\\Desktop\\ViziGenesis\\data\\transcripts",
+    "central_bank": "C:\\Users\\abc23\\Desktop\\ViziGenesis\\data\\central_bank"
+  },
+  "stats": {
+    "central_bank": {
+      "fed_speeches": 15,
+      "fomc_statements": 15,
+      "fomc_minutes": 15,
+      "fed_testimony": 15,
+      "fomc_calendar": 24
+    },
+    "elapsed_seconds": 1.8
+  }
+}

@@ -1,0 +1,122 @@
+[
+  {
+    "date": "2024-01-31",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2024-03-20",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2024-05-01",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2024-06-12",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2024-07-31",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2024-09-18",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2024-11-07",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2024-12-18",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2025-01-29",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2025-03-19",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2025-05-07",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2025-06-18",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2025-07-30",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2025-09-17",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2025-10-29",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2025-12-17",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2026-01-28",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2026-03-18",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2026-04-29",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2026-06-17",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2026-07-29",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2026-09-16",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2026-10-28",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  },
+  {
+    "date": "2026-12-16",
+    "type": "FOMC",
+    "source": "federal_reserve_schedule"
+  }
+]

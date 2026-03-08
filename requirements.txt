@@ -1,19 +1,19 @@
 # ViziGenesis — Dependencies
-# Python 3.10.11
+# Python 3.10+
 
 # Web framework
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-websockets==12.0
+websockets>=12.0
 
 # Data & Finance
-yfinance==0.2.40
+yfinance>=1.0.0
 financedatabase==2.3.0
 tradingview_ta==3.3.0
 pandas==2.2.2
 numpy==1.26.4
 
-# Machine Learning
+# Machine Learning (core)
 torch>=2.1.0
 scikit-learn==1.5.1
 joblib==1.4.2
@@ -21,6 +21,15 @@ joblib==1.4.2
 # V2 — Tree models (optional but recommended)
 lightgbm>=4.1.0
 xgboost>=2.0.0
+
+# Financial LLM fine-tuning (install on training machine with GPU)
+# pip install transformers accelerate peft bitsandbytes datasets trl
+transformers>=4.40.0
+accelerate>=0.28.0
+peft>=0.10.0
+bitsandbytes>=0.43.0
+datasets>=2.18.0
+trl>=0.8.0
 
 # Macro data source: World Bank Data360 (no dedicated client dependency required)
 

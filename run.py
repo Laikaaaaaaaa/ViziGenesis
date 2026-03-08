@@ -6,6 +6,8 @@ Examples:
   python run.py --mode serve --port 8000
   python run.py --mode train --symbol AAPL --epoch 20
   python run.py --mode evaluate --symbol AAPL --split test
+    python run.py --mode vizi-train --run-name vizi-o1 --vizi-epochs 30
+  python run.py --mode vizi-test
 """
 import argparse
 import os
@@ -61,7 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         default="serve",
-        choices=["serve", "train", "evaluate", "validate", "test", "check-accuracy", "package"],
+        choices=["serve", "train", "evaluate", "validate", "test", "check-accuracy", "package",
+                 "vizi-train", "vizi-test", "vizi-profile", "vizi-evaluate"],
         help="Execution mode",
     )
     parser.add_argument("--symbol", default="AAPL", help="Stock symbol, e.g. AAPL")
@@ -80,6 +83,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="FRED API key (sets FRED_API_KEY environment variable for this run)",
     )
+
+    # vizi-ai arguments
+    parser.add_argument("--run-name", default="vizi-o1", help="Run name for vizi-train versioning")
+    parser.add_argument("--vizi-epochs", type=int, default=30, help="Max epochs for vizi-train")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for vizi-train")
+    parser.add_argument("--specialist-warmup", action="store_true",
+                        help="Enable per-stock specialist warm-up before vizi-train")
+    parser.add_argument("--run-dir", default=None, help="Run directory for vizi-evaluate")
+
     return parser
 
 
@@ -102,6 +114,40 @@ def main():
             reload=args.reload,
             log_level="info",
         )
+        return
+
+    # ── Vizi-AI multi-modal modes ──
+    if args.mode.startswith("vizi-"):
+        from backend.vizi_ai import orchestrator
+        vizi_cmd = args.mode.replace("vizi-", "")
+        # Build a namespace matching the orchestrator's expectations
+        vizi_args = argparse.Namespace(
+            command=vizi_cmd,
+            run_name=args.run_name,
+            epochs=args.vizi_epochs,
+            batch_size=args.batch_size,
+            lr=3e-4,
+            d_model=None,
+            n_layers=None,
+            val_every=500,
+            patience=5,
+            specialist_warmup=args.specialist_warmup,
+            skip_collect=True,
+            section=None,
+            run_dir=args.run_dir or "",
+            split=args.split,
+        )
+        cmd_map = {
+            "train": orchestrator.cmd_train,
+            "test": orchestrator.cmd_test,
+            "profile": orchestrator.cmd_profile,
+            "evaluate": orchestrator.cmd_evaluate,
+        }
+        fn = cmd_map.get(vizi_cmd)
+        if fn:
+            fn(vizi_args)
+        else:
+            print(f"Unknown vizi command: {vizi_cmd}")
         return
 
     print(f"⚡ Running mode: {args.mode} | symbol={args.symbol} | ai-mode={args.ai_mode} | period={args.period or 'default'}")

@@ -1,0 +1,10 @@
+{
+  "macro_qa": 185,
+  "stock_qa": 238,
+  "cross_asset_qa": 6,
+  "financial_literacy": 5,
+  "news_qa": 156,
+  "total": 590,
+  "train": 531,
+  "val": 59
+}

@@ -82,6 +82,10 @@ yarn-debug.log*
 yarn-error.log*
 lerna-debug.log*
 
+# Local runtime/cache databases
+cookies.db
+tkr-tz.db
+
 # Model artifacts (optional - adjust based on project needs)
 # Uncomment to ignore trained models
 # models/*/model*.pt
