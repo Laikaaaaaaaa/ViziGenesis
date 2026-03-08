@@ -44,7 +44,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -74,6 +74,22 @@ def _autocast_ctx(device_type: str, enabled: bool = True):
         return autocast(enabled=enabled)
 
     return nullcontext()
+
+
+def _make_grad_scaler(device_type: str, enabled: bool = True):
+    """Compatibility wrapper for GradScaler across PyTorch versions."""
+    if not enabled:
+        # Keep object creation simple for call sites; disabled scaler is a no-op.
+        if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+            return torch.amp.GradScaler(device_type, enabled=False)
+        return torch.cuda.amp.GradScaler(enabled=False)
+
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        # Preferred API (avoids deprecation warning on newer versions).
+        return torch.amp.GradScaler(device_type, enabled=True)
+
+    # Legacy fallback for older PyTorch releases.
+    return torch.cuda.amp.GradScaler(enabled=(enabled and device_type == "cuda"))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -331,7 +347,7 @@ class ViziTrainer:
         )
 
         # AMP scaler
-        self.scaler = GradScaler(enabled=self.train_cfg.use_amp)
+        self.scaler = _make_grad_scaler(self.device.type, enabled=self.train_cfg.use_amp)
 
         # State
         self.global_step = 0
@@ -762,7 +778,7 @@ def train_per_stock_specialists(
         weight_decay=train_cfg.weight_decay,
     )
     loss_fn = UncertaintyMultiTaskLoss(n_tasks=5).to(device)
-    scaler = GradScaler(enabled=(train_cfg.use_amp and device.type == "cuda"))
+    scaler = _make_grad_scaler(device.type, enabled=train_cfg.use_amp)
 
     for sym_idx, sym in enumerate(symbols):
         loader = create_dataloader(
