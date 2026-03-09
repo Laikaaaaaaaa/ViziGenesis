@@ -95,6 +95,13 @@ tkr-tz.db
 # data/*/local.csv
 # data/*/yahoo.csv
 
+# Large datasets and training artifacts (never commit)
+data/**
+
+# Keep lightweight data scripts in repo
+!data/*.py
+!data/**/*.py
+
 # Docker
 .dockerignore
 docker-compose.override.yml

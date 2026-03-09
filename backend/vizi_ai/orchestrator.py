@@ -69,9 +69,17 @@ def cmd_profile(args):
     """Profile the model: parameter count, VRAM estimate, architecture."""
     from backend.vizi_ai.model import ModelConfig, ViziMarketTransformer
 
-    cfg = ModelConfig()
+    preset = getattr(args, "preset", None)
+    if preset == "h100":
+        cfg = ModelConfig.h100_preset()
+    elif preset == "h100-moe":
+        cfg = ModelConfig.h100_moe_preset()
+    else:
+        cfg = ModelConfig()
+
     if args.d_model:
         cfg.d_model = args.d_model
+        cfg.d_ff = args.d_model * 4
     if args.n_layers:
         cfg.n_layers = args.n_layers
 
@@ -79,24 +87,27 @@ def cmd_profile(args):
     print(model.summary())
 
     # VRAM estimate
-    total_params = model.count_parameters()
+    total_params = model.count_parameters(only_trainable=False)
     # fp16 params + optimizer states (Adam: 2× model) + gradients
     fp16_mb = total_params * 2 / 1e6
     adam_states_mb = total_params * 4 * 2 / 1e6  # fp32 for m and v
     grad_mb = total_params * 2 / 1e6
     # Activations (rough: batch_size × seq_len × d_model × n_layers × 4 bytes)
     act_mb = args.batch_size * 200 * cfg.d_model * (cfg.n_layers + cfg.fusion_layers) * 4 / 1e6
+    # Gradient checkpointing reduces activation memory by ~60%
+    if cfg.gradient_checkpointing:
+        act_mb *= 0.4
 
     total_vram = fp16_mb + adam_states_mb + grad_mb + act_mb
     print(f"\nVRAM Estimate (batch_size={args.batch_size}):")
     print(f"  Model (fp16):    {fp16_mb:>8.1f} MB")
     print(f"  Adam states:     {adam_states_mb:>8.1f} MB")
     print(f"  Gradients:       {grad_mb:>8.1f} MB")
-    print(f"  Activations:     {act_mb:>8.1f} MB")
+    print(f"  Activations:     {act_mb:>8.1f} MB" + (" (checkpointed)" if cfg.gradient_checkpointing else ""))
     print(f"  ─────────────────────────────")
     print(f"  Total:           {total_vram:>8.1f} MB")
     print(f"\n  RTX 4090 (24GB): {'✓ FITS' if total_vram < 22000 else '✗ TOO LARGE — reduce batch/model'}")
-    print(f"  B200 (80GB):     {'✓ FITS' if total_vram < 75000 else '✗ TOO LARGE'}")
+    print(f"  H100 SXM (80GB): {'✓ FITS' if total_vram < 75000 else '✗ TOO LARGE'}")
 
 
 def cmd_collect(args):
@@ -125,7 +136,6 @@ def cmd_train(args):
 
     # ── Configure ──
     data_cfg = DataConfig()
-    model_cfg = ModelConfig()
     train_cfg = TrainConfig(
         run_name=args.run_name,
         max_epochs=args.epochs,
@@ -133,13 +143,33 @@ def cmd_train(args):
         lr=args.lr,
         val_every_steps=args.val_every,
         patience=args.patience,
+        run_time_estimate=getattr(args, "time_estimate", False),
+        self_improve=not getattr(args, "no_self_improve", False) if hasattr(args, "no_self_improve") else getattr(args, "self_improve", True),
     )
 
+    # ── Model config (preset or manual) ──
+    preset = getattr(args, "preset", None)
+    if preset == "h100":
+        model_cfg = ModelConfig.h100_preset()
+        logger.info("Using H100 dense preset (d_model=512, n_layers=8)")
+    elif preset == "h100-moe":
+        model_cfg = ModelConfig.h100_moe_preset()
+        logger.info("Using H100 MoE preset (d_model=512, 8 experts, top-2)")
+    else:
+        model_cfg = ModelConfig()
+
+    # Manual overrides
     if args.d_model:
         model_cfg.d_model = args.d_model
         model_cfg.d_ff = args.d_model * 4
     if args.n_layers:
         model_cfg.n_layers = args.n_layers
+    if getattr(args, "gradient_checkpointing", False):
+        model_cfg.gradient_checkpointing = True
+    if getattr(args, "moe", False):
+        model_cfg.use_moe = True
+    if getattr(args, "n_experts", None):
+        model_cfg.n_experts = args.n_experts
 
     logger.info("═" * 60)
     logger.info("ViziGenesis Multi-Modal Training — %s", train_cfg.run_name)
@@ -327,6 +357,8 @@ def build_parser():
     p_prof.add_argument("--d-model", type=int, default=None)
     p_prof.add_argument("--n-layers", type=int, default=None)
     p_prof.add_argument("--batch-size", type=int, default=64)
+    p_prof.add_argument("--preset", default=None, choices=["h100", "h100-moe"],
+                        help="Model config preset")
 
     # ── collect ──
     p_coll = sub.add_parser("collect", help="Collect financial data")
@@ -348,6 +380,20 @@ def _add_train_args(parser):
                         help="Run per-stock specialist warm-up before full training")
     parser.add_argument("--parallel-stocks", type=int, default=0,
                         help="Stocks per parallel mega-batch in Phase 1 (0=auto-detect from VRAM)")
+    # H100 / architecture presets
+    parser.add_argument("--preset", default=None, choices=["h100", "h100-moe"],
+                        help="Use a predefined model config preset (h100: 120M dense, h100-moe: 250M+ sparse)")
+    parser.add_argument("--gradient-checkpointing", action="store_true",
+                        help="Enable gradient checkpointing to save VRAM")
+    parser.add_argument("--moe", action="store_true",
+                        help="Enable Mixture-of-Experts feed-forward layers")
+    parser.add_argument("--n-experts", type=int, default=None,
+                        help="Number of MoE experts (default: 8)")
+    # Training utilities
+    parser.add_argument("--time-estimate", action="store_true",
+                        help="Run a pre-training time estimate before training")
+    parser.add_argument("--no-self-improve", action="store_true",
+                        help="Disable self-improvement tracking")
 
 
 def _add_collect_args(parser):

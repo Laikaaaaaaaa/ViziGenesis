@@ -15,8 +15,9 @@ Architecture overview
              │                  │                    │
              ▼                  ▼                    ▼
     ┌───────────────────────────────────────────────────────────┐
-    │              Cross-Modal Fusion Transformer               │
-    │  (Learnable [CLS] token attends to all modality tokens)  │
+    │    Cross-Modal Fusion Transformer  (with MoE option)     │
+    │  (Learnable [CLS] token + cross-attention across all     │
+    │   modality tokens, optional Mixture-of-Experts FFN)      │
     └───────────────────────────┬───────────────────────────────┘
                                 │
                ┌────────────────┼────────────────┐
@@ -44,7 +45,17 @@ Design rationale
    multi-faceted nature of market prediction: direction for trading,
    returns for sizing, regime for risk management.
 
-Parameters: ~20-30M for RTX 4090 (24GB VRAM with AMP).
+5. **Gradient checkpointing** (optional) trades compute for VRAM,
+   enabling ≥2× larger models on the same GPU.
+
+6. **Mixture-of-Experts (MoE)** feed-forward layers (optional) scale
+   capacity without proportional FLOPs increase: only top-k experts
+   are active per token.
+
+Scaling:
+  • RTX 4090 (24 GB): d_model=256, n_layers=4   → ~25M params
+  • H100 SXM (80 GB): d_model=512, n_layers=8   → ~120M params
+  • H100 + MoE:       d_model=512, n_experts=8   → ~250M+ params (sparse)
 """
 from __future__ import annotations
 
@@ -54,6 +65,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -61,11 +73,10 @@ import torch.nn.functional as F
 # ═══════════════════════════════════════════════════════════════
 class ModelConfig:
     """
-    Central model hyperparameters.  Sized for RTX 4090 (24 GB).
+    Central model hyperparameters.  Sized for RTX 4090 (24 GB) by default.
 
-    Scaling notes:
-    • B200 (80 GB): double d_model to 512, n_layers to 8, batch 512
-    • Multi-GPU: wrap in DDP, keep config unchanged
+    Use ``ModelConfig.h100_preset()`` for H100 SXM (80 GB) scaling.
+    Use ``ModelConfig.h100_moe_preset()`` for H100 + MoE (sparse 250M+).
     """
     # Core dimensions
     d_model: int = 256
@@ -98,10 +109,36 @@ class ModelConfig:
     n_return_horizons: int = 3   # 1d, 5d, 21d
     n_regimes: int = 3           # bear, sideways, bull
 
+    # Gradient checkpointing (saves VRAM at cost of ~30% more compute)
+    gradient_checkpointing: bool = False
+
+    # Mixture-of-Experts
+    use_moe: bool = False
+    n_experts: int = 8
+    top_k_experts: int = 2       # active experts per token
+    moe_aux_loss_weight: float = 0.01  # load-balancing auxiliary loss
+
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
             if hasattr(self, k):
                 setattr(self, k, v)
+
+    @classmethod
+    def h100_preset(cls) -> "ModelConfig":
+        """Dense H100 SXM (80 GB) preset: ~120M params."""
+        return cls(
+            d_model=512, n_heads=16, n_layers=8, fusion_layers=8,
+            d_ff=2048, dropout=0.12, gradient_checkpointing=True,
+        )
+
+    @classmethod
+    def h100_moe_preset(cls) -> "ModelConfig":
+        """Sparse MoE H100 preset: ~250M+ total params, ~60M active per token."""
+        return cls(
+            d_model=512, n_heads=16, n_layers=8, fusion_layers=8,
+            d_ff=2048, dropout=0.10, gradient_checkpointing=True,
+            use_moe=True, n_experts=8, top_k_experts=2,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -152,26 +189,106 @@ class TemporalBlock(nn.Module):
     """
     Single transformer encoder layer with RoPE.
     Pre-norm architecture (more stable for deep networks).
+    Optionally uses MoE feed-forward.
     """
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float,
+                 use_moe: bool = False, n_experts: int = 8, top_k: int = 2,
+                 moe_aux_weight: float = 0.01):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.norm2 = nn.LayerNorm(d_model)
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_ff, d_model),
-            nn.Dropout(dropout),
-        )
+
+        self.use_moe = use_moe
+        if use_moe:
+            self.ff = MoEFeedForward(d_model, d_ff, n_experts, top_k, dropout, moe_aux_weight)
+        else:
+            self.ff = nn.Sequential(
+                nn.Linear(d_model, d_ff),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_ff, d_model),
+                nn.Dropout(dropout),
+            )
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         h = self.norm1(x)
         h, _ = self.attn(h, h, h, attn_mask=mask)
         x = x + h
-        x = x + self.ff(self.norm2(x))
+        if self.use_moe:
+            ff_out, _ = self.ff(self.norm2(x))
+            x = x + ff_out
+        else:
+            x = x + self.ff(self.norm2(x))
         return x
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Mixture-of-Experts Feed-Forward
+# ═══════════════════════════════════════════════════════════════
+class MoEFeedForward(nn.Module):
+    """
+    Top-k gated Mixture-of-Experts feed-forward layer.
+
+    Each expert is a standard 2-layer FFN.  A lightweight router
+    selects the top-k experts per token, enabling massive capacity
+    without proportional FLOPs.  Includes an auxiliary load-balancing
+    loss (Switch Transformer / GShard style).
+    """
+    def __init__(self, d_model: int, d_ff: int, n_experts: int = 8,
+                 top_k: int = 2, dropout: float = 0.1,
+                 aux_loss_weight: float = 0.01):
+        super().__init__()
+        self.n_experts = n_experts
+        self.top_k = top_k
+        self.aux_loss_weight = aux_loss_weight
+
+        self.router = nn.Linear(d_model, n_experts, bias=False)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_ff),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_ff, d_model),
+                nn.Dropout(dropout),
+            )
+            for _ in range(n_experts)
+        ])
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        x: (B, T, D)
+        Returns: (output, aux_loss)
+        """
+        B, T, D = x.shape
+        x_flat = x.view(-1, D)  # (B*T, D)
+
+        # Router logits → top-k selection
+        logits = self.router(x_flat)                      # (B*T, n_experts)
+        topk_vals, topk_idx = logits.topk(self.top_k, dim=-1)  # (B*T, top_k)
+        topk_weights = F.softmax(topk_vals, dim=-1)       # (B*T, top_k)
+
+        # Dispatch to experts
+        output = torch.zeros_like(x_flat)
+        for k in range(self.top_k):
+            expert_idx = topk_idx[:, k]       # (B*T,)
+            weight = topk_weights[:, k:k+1]   # (B*T, 1)
+            for e in range(self.n_experts):
+                mask = (expert_idx == e)
+                if mask.any():
+                    expert_input = x_flat[mask]
+                    expert_output = self.experts[e](expert_input)
+                    output[mask] += weight[mask] * expert_output
+
+        # Load-balancing auxiliary loss (encourages uniform expert usage)
+        router_probs = F.softmax(logits, dim=-1)          # (B*T, n_experts)
+        avg_prob = router_probs.mean(dim=0)                # (n_experts,)
+        # Fraction of tokens routed to each expert
+        one_hot = F.one_hot(topk_idx[:, 0], self.n_experts).float()
+        avg_frac = one_hot.mean(dim=0)                     # (n_experts,)
+        aux_loss = self.aux_loss_weight * self.n_experts * (avg_prob * avg_frac).sum()
+
+        return output.view(B, T, D), aux_loss
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -180,46 +297,39 @@ class TemporalBlock(nn.Module):
 class PriceEncoder(nn.Module):
     """
     Encodes OHLCV + technical indicator sequences.
-
-    Why a dedicated encoder?
-    Price series have unique properties: non-stationarity, volatility
-    clustering, fat tails.  The encoder projects features, applies RoPE
-    for temporal awareness, then uses transformer layers with causal
-    masking to prevent look-ahead.
+    Supports gradient checkpointing for VRAM savings.
     """
     def __init__(self, cfg: ModelConfig):
         super().__init__()
+        self.gradient_checkpointing = cfg.gradient_checkpointing
         self.proj = nn.Linear(cfg.n_price_features, cfg.d_model)
         self.rope = RotaryPositionalEncoding(cfg.d_model, cfg.price_seq_len + 16)
         self.blocks = nn.ModuleList([
-            TemporalBlock(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout)
+            TemporalBlock(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout,
+                          use_moe=cfg.use_moe, n_experts=cfg.n_experts,
+                          top_k=cfg.top_k_experts, moe_aux_weight=cfg.moe_aux_loss_weight)
             for _ in range(cfg.n_layers)
         ])
         self.norm = nn.LayerNorm(cfg.d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, T, n_price_feat) → (B, T, d_model)"""
         h = self.proj(x)
         h = self.rope(h)
-        # Causal mask: each position can only attend to itself and earlier
         T = h.size(1)
         mask = torch.triu(torch.ones(T, T, device=h.device), diagonal=1).bool()
         for block in self.blocks:
-            h = block(h, mask=mask)
+            if self.gradient_checkpointing and self.training:
+                h = activation_checkpoint(block, h, mask, use_reentrant=False)
+            else:
+                h = block(h, mask=mask)
         return self.norm(h)
 
 
 class MacroEncoder(nn.Module):
-    """
-    Encodes macroeconomic indicator sequences.
-
-    Macro data is lower-frequency and smoother than price data.
-    Uses fewer layers and no causal mask (macro is released
-    simultaneously, so there's no temporal ordering issue within a
-    snapshot).
-    """
+    """Encodes macroeconomic indicator sequences."""
     def __init__(self, cfg: ModelConfig):
         super().__init__()
+        self.gradient_checkpointing = cfg.gradient_checkpointing
         self.proj = nn.Linear(cfg.n_macro_features, cfg.d_model)
         self.rope = RotaryPositionalEncoding(cfg.d_model, cfg.macro_seq_len + 16)
         n = max(cfg.n_layers // 2, 2)
@@ -230,11 +340,13 @@ class MacroEncoder(nn.Module):
         self.norm = nn.LayerNorm(cfg.d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, T_macro, n_macro) → (B, T_macro, d_model)"""
         h = self.proj(x)
         h = self.rope(h)
         for block in self.blocks:
-            h = block(h)
+            if self.gradient_checkpointing and self.training:
+                h = activation_checkpoint(block, h, use_reentrant=False)
+            else:
+                h = block(h)
         return self.norm(h)
 
 
@@ -242,6 +354,7 @@ class MarketEncoder(nn.Module):
     """Encodes cross-market index / commodity / FX / crypto returns."""
     def __init__(self, cfg: ModelConfig):
         super().__init__()
+        self.gradient_checkpointing = cfg.gradient_checkpointing
         self.proj = nn.Linear(cfg.n_market_features, cfg.d_model)
         self.rope = RotaryPositionalEncoding(cfg.d_model, cfg.macro_seq_len + 16)
         self.blocks = nn.ModuleList([
@@ -254,7 +367,10 @@ class MarketEncoder(nn.Module):
         h = self.proj(x)
         h = self.rope(h)
         for block in self.blocks:
-            h = block(h)
+            if self.gradient_checkpointing and self.training:
+                h = activation_checkpoint(block, h, use_reentrant=False)
+            else:
+                h = block(h)
         return self.norm(h)
 
 
@@ -327,18 +443,11 @@ class CrossModalFusion(nn.Module):
     """
     Concatenates tokens from all modality encoders and applies a
     shared transformer.  A learnable [CLS] token aggregates the
-    final representation.
-
-    Why cross-attention fusion?
-    ─ A rate cut (macro) changes the impact of a price pattern (OHLCV)
-    ─ A negative earnings call (news) modifies fundamental signals
-    ─ Market-wide sell-off (cross-market) contextualises single-stock moves
-
-    The fusion transformer lets every modality token attend to every
-    other, enabling the model to learn these complex interactions.
+    final representation.  Supports gradient checkpointing and MoE.
     """
     def __init__(self, cfg: ModelConfig):
         super().__init__()
+        self.gradient_checkpointing = cfg.gradient_checkpointing
         self.cls_token = nn.Parameter(torch.randn(1, 1, cfg.d_model) * 0.02)
 
         # Modality-type embeddings (like token-type embeddings in BERT)
@@ -346,7 +455,9 @@ class CrossModalFusion(nn.Module):
         self.modality_embed = nn.Embedding(7, cfg.d_model)
 
         self.blocks = nn.ModuleList([
-            TemporalBlock(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout)
+            TemporalBlock(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout,
+                          use_moe=cfg.use_moe, n_experts=cfg.n_experts,
+                          top_k=cfg.top_k_experts, moe_aux_weight=cfg.moe_aux_loss_weight)
             for _ in range(cfg.fusion_layers)
         ])
         self.norm = nn.LayerNorm(cfg.d_model)
@@ -377,7 +488,10 @@ class CrossModalFusion(nn.Module):
         seq = torch.cat([cls, price_tokens, macro_tokens, market_tokens, fund_token, news_tokens, stock_token], dim=1)
 
         for block in self.blocks:
-            seq = block(seq)
+            if self.gradient_checkpointing and self.training:
+                seq = activation_checkpoint(block, seq, use_reentrant=False)
+            else:
+                seq = block(seq)
 
         # Extract CLS token
         cls_out = self.norm(seq[:, 0, :])  # (B, D)
@@ -449,21 +563,11 @@ class ViziMarketTransformer(nn.Module):
     """
     The complete multi-modal, multi-stock market prediction model.
 
-    Forward pass:
-    1. Each modality encoder produces a sequence of d_model tokens
-    2. Cross-modal fusion transformer attends across all tokens
-    3. [CLS] token → prediction heads
-
-    Parameter count (~25M for default config):
-    - Price encoder:  ~3M  (4 layers × 256 dim)
-    - Macro encoder:  ~1.5M
-    - Market encoder: ~1.5M
-    - Fund encoder:   ~0.5M
-    - News encoder:   ~1M  (embedding + attention)
-    - Fusion:         ~12M (4 layers × 256 dim, long sequences)
-    - Heads:          ~1M
-    - Stock embed:    ~0.1M
-    - Total:          ~20-25M
+    Supports:
+    - Dense mode: standard transformer FFN (~25-120M params)
+    - Sparse MoE mode: Mixture-of-Experts FFN (~250M+ total, ~60M active)
+    - Gradient checkpointing: saves ~50% VRAM for larger models
+    - H100 presets: auto-configured for 80GB HBM3
     """
 
     def __init__(self, cfg: Optional[ModelConfig] = None):
@@ -503,22 +607,13 @@ class ViziMarketTransformer(nn.Module):
             nn.init.zeros_(module.bias)
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            batch: dict from collate_multimodal with keys:
-                price_seq, macro_seq, market_seq, fundamental,
-                news_ids, stock_id
-
-        Returns:
-            dict with prediction head outputs
-        """
         # Encode each modality
-        price_tokens = self.price_enc(batch["price_seq"])        # (B, T_price, D)
-        macro_tokens = self.macro_enc(batch["macro_seq"])        # (B, T_macro, D)
-        market_tokens = self.market_enc(batch["market_seq"])     # (B, T_macro, D)
-        fund_token = self.fund_enc(batch["fundamental"])         # (B, 1, D)
-        news_tokens = self.news_enc(batch["news_ids"])           # (B, N_news, D)
-        stock_token = self.stock_embed(batch["stock_id"]).unsqueeze(1)  # (B, 1, D)
+        price_tokens = self.price_enc(batch["price_seq"])
+        macro_tokens = self.macro_enc(batch["macro_seq"])
+        market_tokens = self.market_enc(batch["market_seq"])
+        fund_token = self.fund_enc(batch["fundamental"])
+        news_tokens = self.news_enc(batch["news_ids"])
+        stock_token = self.stock_embed(batch["stock_id"]).unsqueeze(1)
 
         # Fuse all modalities
         cls = self.fusion(
@@ -529,11 +624,14 @@ class ViziMarketTransformer(nn.Module):
         # Predict
         return self.heads(cls)
 
-    def count_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+    def count_parameters(self, only_trainable: bool = True) -> int:
+        if only_trainable:
+            return sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return sum(p.numel() for p in self.parameters())
 
     def summary(self) -> str:
-        total = self.count_parameters()
+        total = self.count_parameters(only_trainable=False)
+        trainable = self.count_parameters(only_trainable=True)
         parts = {
             "price_enc": sum(p.numel() for p in self.price_enc.parameters()),
             "macro_enc": sum(p.numel() for p in self.macro_enc.parameters()),
@@ -544,7 +642,17 @@ class ViziMarketTransformer(nn.Module):
             "heads": sum(p.numel() for p in self.heads.parameters()),
             "stock_embed": sum(p.numel() for p in self.stock_embed.parameters()),
         }
-        lines = [f"ViziMarketTransformer — {total:,} parameters"]
+        lines = [
+            f"ViziMarketTransformer — {total:,} total params ({trainable:,} trainable)",
+            f"  config: d_model={self.cfg.d_model}, n_layers={self.cfg.n_layers}, "
+            f"fusion={self.cfg.fusion_layers}, d_ff={self.cfg.d_ff}",
+        ]
+        if self.cfg.use_moe:
+            lines.append(
+                f"  MoE: {self.cfg.n_experts} experts, top-{self.cfg.top_k_experts} active"
+            )
+        if self.cfg.gradient_checkpointing:
+            lines.append("  gradient_checkpointing: enabled")
         for name, count in parts.items():
             lines.append(f"  {name:15s}: {count:>10,}  ({count/total*100:.1f}%)")
         return "\n".join(lines)

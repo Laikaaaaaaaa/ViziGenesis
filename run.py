@@ -111,6 +111,20 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Stocks per parallel mega-batch in Phase 1 (0=auto-detect from VRAM)")
     parser.add_argument("--run-dir", default=None, help="Run directory for vizi-evaluate")
 
+    # H100 / architecture presets
+    parser.add_argument("--preset", default=None, choices=["h100", "h100-moe"],
+                        help="Model config preset (h100: 120M dense, h100-moe: 250M+ sparse)")
+    parser.add_argument("--gradient-checkpointing", action="store_true",
+                        help="Enable gradient checkpointing to save VRAM")
+    parser.add_argument("--moe", action="store_true",
+                        help="Enable Mixture-of-Experts FFN layers")
+    parser.add_argument("--n-experts", type=int, default=None,
+                        help="Number of MoE experts (default: 8)")
+    parser.add_argument("--time-estimate", action="store_true",
+                        help="Run pre-training time estimate")
+    parser.add_argument("--no-self-improve", action="store_true",
+                        help="Disable self-improvement tracking")
+
     return parser
 
 
@@ -157,6 +171,13 @@ def main():
             section=None,
             run_dir=args.run_dir or "",
             split=args.split,
+            # H100 / architecture presets
+            preset=args.preset,
+            gradient_checkpointing=args.gradient_checkpointing,
+            moe=args.moe,
+            n_experts=args.n_experts,
+            time_estimate=args.time_estimate,
+            self_improve=not args.no_self_improve,
         )
         cmd_map = {
             "train": orchestrator.cmd_train,
