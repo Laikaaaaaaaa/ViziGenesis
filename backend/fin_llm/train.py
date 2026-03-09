@@ -65,6 +65,12 @@ DEFAULT_CONFIG = {
     "save_steps": 200,
     "eval_steps": 200,
     "save_total_limit": 3,
+
+    # Data quality
+    "min_instruction_chars": 8,
+    "min_output_chars": 24,
+    "max_output_chars": 12000,
+    "dedupe_examples": True,
 }
 
 
@@ -98,8 +104,52 @@ def load_training_data(train_path: str, eval_path: str):
                     continue
         return items
 
-    train_items = load_jsonl(train_path)
-    eval_items = load_jsonl(eval_path)
+    def quality_filter(items):
+        cleaned = []
+        seen = set()
+        dropped_empty = 0
+        dropped_short = 0
+        dropped_long = 0
+        dropped_dupe = 0
+
+        for it in items:
+            instruction = str(it.get("instruction", "")).strip()
+            input_text = str(it.get("input", "")).strip()
+            output = str(it.get("output", "")).strip()
+
+            if not instruction or not output:
+                dropped_empty += 1
+                continue
+            if len(instruction) < DEFAULT_CONFIG["min_instruction_chars"] or len(output) < DEFAULT_CONFIG["min_output_chars"]:
+                dropped_short += 1
+                continue
+            if len(output) > DEFAULT_CONFIG["max_output_chars"]:
+                dropped_long += 1
+                continue
+
+            normalized = {
+                "instruction": instruction,
+                "input": input_text,
+                "output": output,
+            }
+
+            if DEFAULT_CONFIG["dedupe_examples"]:
+                sig = (instruction.lower(), input_text.lower(), output.lower())
+                if sig in seen:
+                    dropped_dupe += 1
+                    continue
+                seen.add(sig)
+
+            cleaned.append(normalized)
+
+        print(
+            "Data quality filter: kept=%d, dropped_empty=%d, dropped_short=%d, dropped_long=%d, dropped_dupe=%d"
+            % (len(cleaned), dropped_empty, dropped_short, dropped_long, dropped_dupe)
+        )
+        return cleaned
+
+    train_items = quality_filter(load_jsonl(train_path))
+    eval_items = quality_filter(load_jsonl(eval_path)) if eval_path else []
 
     if not train_items:
         raise ValueError(f"No training data found at {train_path}")
@@ -186,8 +236,18 @@ def train(config: Dict) -> None:
         gpu_name = torch.cuda.get_device_name(0)
         gpu_mem = torch.cuda.get_device_properties(0).total_mem / 1e9
         print(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
+        # TF32 improves throughput on Ampere/Hopper with minimal quality impact.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     else:
         print("WARNING: No GPU detected. Training will be extremely slow.")
+
+    # Hardware-aware dtype selection.
+    bf16_supported = bool(torch.cuda.is_available() and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported())
+    if config.get("bf16", True) and not bf16_supported:
+        print("bf16 not supported on this GPU/runtime, falling back to fp16")
+        config["bf16"] = False
+        config["fp16"] = True
 
     # ── 1. Load tokenizer ──
     print("\nLoading tokenizer...")
@@ -270,6 +330,7 @@ def train(config: Dict) -> None:
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         dataloader_num_workers=2,
+        group_by_length=True,
         seed=42,
     )
 

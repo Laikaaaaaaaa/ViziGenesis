@@ -27,6 +27,13 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / "data"
 
+STOPWORDS = {
+    "the", "and", "for", "with", "from", "this", "that", "what", "when", "where",
+    "how", "why", "into", "about", "over", "under", "your", "ours", "their", "than",
+    "then", "have", "has", "had", "were", "was", "are", "is", "be", "been", "being",
+    "stock", "stocks", "market", "markets", "analysis", "please", "show", "tell", "me",
+}
+
 
 class FinancialRAG:
     """
@@ -196,6 +203,57 @@ class FinancialRAG:
                     break
         return matches
 
+    def _tokenize(self, text: str) -> List[str]:
+        text = re.sub(r"[^a-zA-Z0-9\.\-\s]", " ", (text or "").lower())
+        toks = [t for t in text.split() if len(t) > 1 and t not in STOPWORDS]
+        return toks
+
+    def _text_overlap_score(self, query: str, text: str) -> float:
+        q = set(self._tokenize(query))
+        t = set(self._tokenize(text))
+        if not q or not t:
+            return 0.0
+        inter = len(q & t)
+        union = len(q | t)
+        if union == 0:
+            return 0.0
+        # Blend query coverage and jaccard for robust ranking on short finance queries.
+        coverage = inter / max(1, len(q))
+        jaccard = inter / union
+        return 0.7 * coverage + 0.3 * jaccard
+
+    def _extract_date(self, item: Dict[str, Any]) -> Optional[datetime]:
+        for key in ("date", "published", "published_at", "timestamp"):
+            val = item.get(key)
+            if not val:
+                continue
+            try:
+                # Accept ISO strings and YYYY-MM-DD style dates.
+                return datetime.fromisoformat(str(val).replace("Z", "+00:00")).replace(tzinfo=None)
+            except Exception:
+                continue
+        return None
+
+    def _recency_boost(self, item: Dict[str, Any], half_life_days: float = 30.0) -> float:
+        dt = self._extract_date(item)
+        if dt is None:
+            return 0.0
+        age_days = max(0.0, (datetime.utcnow() - dt).total_seconds() / 86400.0)
+        return 0.1 * (0.5 ** (age_days / max(1.0, half_life_days)))
+
+    def _context_key(self, ctype: str, item: Dict[str, Any]) -> str:
+        if ctype == "stock":
+            return f"stock:{item.get('symbol', '')}"
+        if ctype == "fundamentals":
+            return f"fund:{item.get('symbol', '')}"
+        if ctype == "macro":
+            return f"macro:{item.get('indicator', '')}"
+        if ctype == "narrative":
+            return f"narr:{item.get('topic', '')}"
+        if ctype == "news":
+            return f"news:{item.get('title', '')[:120]}:{item.get('date', '')}"
+        return f"{ctype}:{str(item)[:120]}"
+
     def retrieve(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         """
         Retrieve relevant context for a query.
@@ -208,26 +266,37 @@ class FinancialRAG:
         tickers = self._extract_tickers(query)
         for ticker in tickers[:5]:
             if ticker in self._stock_cache:
+                stock_item = self._stock_cache[ticker]
+                text = " ".join([
+                    str(stock_item.get("symbol", "")),
+                    str(stock_item.get("text", "")),
+                    str(stock_item.get("returns", "")),
+                ])
+                overlap = self._text_overlap_score(query, text)
                 contexts.append({
                     "type": "stock",
-                    "relevance": 0.9,
-                    "data": self._stock_cache[ticker],
+                    "relevance": min(0.99, 0.75 + 0.2 + 0.15 * overlap),
+                    "data": stock_item,
                 })
             if ticker in self._fundamentals_cache:
+                fund_item = self._fundamentals_cache[ticker]
+                overlap = self._text_overlap_score(query, str(fund_item.get("text", "")))
                 contexts.append({
                     "type": "fundamentals",
-                    "relevance": 0.85,
-                    "data": self._fundamentals_cache[ticker],
+                    "relevance": min(0.98, 0.68 + 0.2 + 0.12 * overlap),
+                    "data": fund_item,
                 })
 
         # 2. Extract and retrieve macro data
         macro_keys = self._extract_macro_keywords(query)
         for key in macro_keys[:8]:
             if key in self._macro_cache:
+                macro_item = self._macro_cache[key]
+                overlap = self._text_overlap_score(query, str(macro_item.get("text", "")) + " " + key)
                 contexts.append({
                     "type": "macro",
-                    "relevance": 0.85,
-                    "data": self._macro_cache[key],
+                    "relevance": min(0.97, 0.74 + 0.14 * overlap),
+                    "data": macro_item,
                 })
 
         # 3. Retrieve correlation narratives
@@ -235,28 +304,56 @@ class FinancialRAG:
         for topic in topics[:3]:
             for narr in self._narratives:
                 if narr.get("topic") == topic:
+                    narr_text = str(narr.get("summary", "")) + " " + str(narr.get("topic", ""))
+                    overlap = self._text_overlap_score(query, narr_text)
                     contexts.append({
                         "type": "narrative",
-                        "relevance": 0.8,
+                        "relevance": min(0.95, 0.66 + 0.2 + 0.14 * overlap),
                         "data": narr,
                     })
                     break
 
         # 4. Search news (simple keyword matching)
-        query_words = set(query.lower().split())
+        query_words = set(self._tokenize(query))
         relevant_news = []
         for art in self._news:
-            title_words = set(art.get("title", "").lower().split())
-            overlap = len(query_words & title_words)
-            if overlap >= 2:
-                relevant_news.append((overlap, art))
+            content = " ".join([
+                str(art.get("title", "")),
+                str(art.get("summary", "")),
+                str(art.get("source", "")),
+            ])
+            overlap_score = self._text_overlap_score(query, content)
+            # Keep moderately-related headlines if we have ticker intent.
+            if overlap_score > 0.08 or (tickers and any(t in content.upper() for t in tickers)):
+                score = 0.35 + 0.45 * overlap_score + self._recency_boost(art)
+                relevant_news.append((score, art))
         relevant_news.sort(key=lambda x: x[0], reverse=True)
-        for score, art in relevant_news[:3]:
+        for score, art in relevant_news[:5]:
             contexts.append({
                 "type": "news",
-                "relevance": min(0.7, score * 0.15),
+                "relevance": min(0.9, float(score)),
                 "data": art,
             })
+
+        # 5. Fallback lexical retrieval if explicit entity extraction is empty.
+        if not contexts:
+            stock_candidates = []
+            for sym, item in self._stock_cache.items():
+                score = self._text_overlap_score(query, f"{sym} {item.get('text', '')}")
+                if score > 0.06:
+                    stock_candidates.append((score, item))
+            stock_candidates.sort(key=lambda x: x[0], reverse=True)
+            for score, item in stock_candidates[:5]:
+                contexts.append({"type": "stock", "relevance": min(0.8, 0.5 + score), "data": item})
+
+        # Deduplicate by semantic key while keeping highest relevance.
+        dedup: Dict[str, Dict[str, Any]] = {}
+        for ctx in contexts:
+            key = self._context_key(ctx["type"], ctx["data"])
+            prev = dedup.get(key)
+            if prev is None or ctx["relevance"] > prev["relevance"]:
+                dedup[key] = ctx
+        contexts = list(dedup.values())
 
         # Sort by relevance and limit
         contexts.sort(key=lambda x: x["relevance"], reverse=True)
@@ -280,15 +377,24 @@ class FinancialRAG:
                 # Construct text from data
                 if ctx["type"] == "stock":
                     d = ctx["data"]
-                    text = f"[STOCK DATA] {d.get('symbol', '')}: ${d.get('latest_price', 0):.2f}, returns: {d.get('returns', {})}"
+                    text = (
+                        f"[STOCK DATA | rel={ctx['relevance']:.2f}] {d.get('symbol', '')}: "
+                        f"${d.get('latest_price', 0):.2f}, returns: {d.get('returns', {})}"
+                    )
                 elif ctx["type"] == "macro":
                     d = ctx["data"]
-                    text = f"[MACRO DATA] {d.get('indicator', '')}: {d.get('latest_value', 0):.4g} ({d.get('pct_change', 0):+.2f}% change)"
+                    text = (
+                        f"[MACRO DATA | rel={ctx['relevance']:.2f}] {d.get('indicator', '')}: "
+                        f"{d.get('latest_value', 0):.4g} ({d.get('pct_change', 0):+.2f}% change)"
+                    )
                 elif ctx["type"] == "fundamentals":
                     text = ctx["data"].get("text", str(ctx["data"]))
                 elif ctx["type"] == "news":
                     d = ctx["data"]
-                    text = f"[NEWS] {d.get('title', '')} ({d.get('date', '')})"
+                    text = f"[NEWS | rel={ctx['relevance']:.2f}] {d.get('title', '')} ({d.get('date', '')})"
+                elif ctx["type"] == "narrative":
+                    d = ctx["data"]
+                    text = f"[NARRATIVE | rel={ctx['relevance']:.2f}] {d.get('summary', d.get('text', ''))}"
 
             # Rough token estimate (4 chars ≈ 1 token)
             token_est = len(text) // 4
