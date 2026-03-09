@@ -22,9 +22,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import sys
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 # ──────────────────── Configuration ────────────────────
 
@@ -71,7 +73,160 @@ DEFAULT_CONFIG = {
     "min_output_chars": 24,
     "max_output_chars": 12000,
     "dedupe_examples": True,
+
+    # News reasoning augmentation
+    "augment_news_reasoning": True,
+    "news_corpus": str(ROOT / "data" / "processed" / "news_corpus.jsonl"),
+    "news_reasoning_max_examples": 30000,
+    "news_eval_ratio": 0.08,
+    "seed": 42,
+
+    # Auto-tune for high-memory GPUs (e.g. H100)
+    "auto_h100_preset": True,
 }
+
+
+_THEME_KEYWORDS = {
+    "monetary_policy": ["fed", "fomc", "interest rate", "rate", "policy", "hawkish", "dovish"],
+    "inflation": ["cpi", "pce", "inflation", "price pressure", "cost"],
+    "labor": ["jobs", "payroll", "unemployment", "claims", "labor"],
+    "growth": ["gdp", "recession", "slowdown", "expansion", "manufacturing", "pmi"],
+    "geopolitics": ["tariff", "sanction", "war", "conflict", "election", "trade"],
+    "energy": ["oil", "gas", "brent", "wti", "energy"],
+    "tech_ai": ["ai", "semiconductor", "chip", "cloud", "software", "data center"],
+    "credit_liquidity": ["credit", "spread", "default", "liquidity", "yield", "treasury"],
+}
+
+
+def _parse_any_date(text: str) -> Optional[datetime]:
+    if not text:
+        return None
+    text = str(text).strip()
+    fmts = [
+        "%a, %d %b %Y %H:%M:%S GMT",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%d",
+    ]
+    for fmt in fmts:
+        try:
+            return datetime.strptime(text, fmt)
+        except Exception:
+            continue
+    # Try fromisoformat as fallback
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _infer_news_themes(text: str) -> List[str]:
+    text_l = (text or "").lower()
+    themes = []
+    for theme, kws in _THEME_KEYWORDS.items():
+        if any(kw in text_l for kw in kws):
+            themes.append(theme)
+    return themes or ["general_macro"]
+
+
+def _news_to_reasoning_example(item: Dict) -> Dict:
+    title = str(item.get("title", "")).strip()
+    content = str(item.get("content", "")).strip()
+    source = str(item.get("source", "unknown")).strip()
+    date = str(item.get("date", "")).strip()
+
+    combined = f"{title}. {content}".strip()
+    themes = _infer_news_themes(combined)
+    theme_str = ", ".join(themes)
+
+    instruction = (
+        "Analyze this financial news in context and forecast likely 1-week to 3-month market impact. "
+        "Estimate scenario probabilities and mention invalidation signals."
+    )
+    input_text = (
+        f"Source: {source}\n"
+        f"Date: {date}\n"
+        f"Headline: {title}\n"
+        f"Content: {content}\n"
+        f"Detected themes: {theme_str}"
+    )
+    output = (
+        "Structured analysis:\n"
+        "1) Event classification and surprise factor\n"
+        f"- Primary themes: {theme_str}\n"
+        "- Decide if this is growth-positive/negative, inflationary/disinflationary, and risk-on/risk-off.\n"
+        "2) Transmission channels\n"
+        "- Explain how this can propagate through rates, USD, yields, credit spreads, earnings expectations, and positioning.\n"
+        "3) Scenario forecast (1w / 1m / 3m)\n"
+        "- Base case (55-65%), Bull case (20-25%), Bear case (15-20%) with clear conditions.\n"
+        "4) Trade construction and risk control\n"
+        "- Suggest candidate sectors/tickers, entry logic, stop logic, and size discipline.\n"
+        "5) Invalidation checklist\n"
+        "- List macro prints, guidance, or price-action signals that would invalidate the thesis."
+    )
+    return {
+        "instruction": instruction,
+        "input": input_text,
+        "output": output,
+    }
+
+
+def _build_news_reasoning_examples(news_path: str, max_examples: int, seed: int) -> List[Dict]:
+    if not news_path or not Path(news_path).exists() or max_examples <= 0:
+        return []
+
+    rows: List[Dict] = []
+    with open(news_path, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            if item.get("type") != "news":
+                continue
+            if not item.get("title") and not item.get("content"):
+                continue
+            rows.append(item)
+
+    if not rows:
+        return []
+
+    rows.sort(key=lambda x: _parse_any_date(x.get("date", "")) or datetime.min, reverse=True)
+    random.seed(seed)
+    if len(rows) > max_examples:
+        # Keep most recent block, then random sample the rest for regime diversity.
+        head_keep = max_examples // 2
+        remaining = rows[head_keep:]
+        tail_pick = random.sample(remaining, k=max_examples - head_keep) if len(remaining) > (max_examples - head_keep) else remaining
+        rows = rows[:head_keep] + tail_pick
+
+    examples = [_news_to_reasoning_example(r) for r in rows]
+    random.shuffle(examples)
+    return examples
+
+
+def _auto_tune_for_gpu(config: Dict) -> Dict:
+    """Adjust defaults for high-memory GPUs if user did not override manually."""
+    import torch
+
+    if not config.get("auto_h100_preset", True) or not torch.cuda.is_available():
+        return config
+
+    mem_gb = torch.cuda.get_device_properties(0).total_mem / 1e9
+    name = torch.cuda.get_device_name(0).lower()
+    is_h100_like = ("h100" in name) or (mem_gb >= 70)
+    if not is_h100_like:
+        return config
+
+    # Conservative but stronger defaults for H100 class cards.
+    config = config.copy()
+    config["model_max_length"] = max(4096, int(config.get("model_max_length", 2048)))
+    config["per_device_train_batch_size"] = max(8, int(config.get("per_device_train_batch_size", 4)))
+    config["per_device_eval_batch_size"] = max(8, int(config.get("per_device_eval_batch_size", 4)))
+    config["gradient_accumulation_steps"] = max(4, int(config.get("gradient_accumulation_steps", 8)) // 2)
+    config["lora_r"] = max(128, int(config.get("lora_r", 64)))
+    config["lora_alpha"] = max(256, int(config.get("lora_alpha", 128)))
+    config["num_train_epochs"] = max(4, int(config.get("num_train_epochs", 3)))
+    return config
 
 
 def check_dependencies() -> bool:
@@ -151,6 +306,19 @@ def load_training_data(train_path: str, eval_path: str):
     train_items = quality_filter(load_jsonl(train_path))
     eval_items = quality_filter(load_jsonl(eval_path)) if eval_path else []
 
+    # Optional synthetic news-reasoning augmentation for stronger event-context understanding.
+    if DEFAULT_CONFIG.get("augment_news_reasoning", True):
+        synth = _build_news_reasoning_examples(
+            DEFAULT_CONFIG.get("news_corpus", ""),
+            int(DEFAULT_CONFIG.get("news_reasoning_max_examples", 0)),
+            int(DEFAULT_CONFIG.get("seed", 42)),
+        )
+        if synth:
+            split = max(1, int(len(synth) * float(DEFAULT_CONFIG.get("news_eval_ratio", 0.08))))
+            eval_items.extend(synth[:split])
+            train_items.extend(synth[split:])
+            print(f"Added synthetic news reasoning examples: train+={len(synth[split:])}, eval+={len(synth[:split])}")
+
     if not train_items:
         raise ValueError(f"No training data found at {train_path}")
 
@@ -198,7 +366,9 @@ def format_chat(example: Dict, tokenizer) -> str:
             "macroeconomics, stock markets, technical analysis, corporate fundamentals, and "
             "global finance. Provide detailed, actionable analysis with specific data points, "
             "historical context, and trading implications. Be precise with numbers and cite "
-            "specific indicators, tickers, and metrics."
+            "specific indicators, tickers, and metrics. Always reason through transmission channels "
+            "(rates -> USD -> yields -> credit -> earnings -> positioning), provide scenario probabilities, "
+            "and include invalidation triggers."
         )},
         {"role": "user", "content": user_msg},
         {"role": "assistant", "content": output},
@@ -224,6 +394,8 @@ def train(config: Dict) -> None:
     )
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
     from trl import SFTTrainer
+
+    config = _auto_tune_for_gpu(config)
 
     print(f"\n{'='*60}")
     print(f"ViziGenesis Financial LLM Training")
@@ -293,6 +465,9 @@ def train(config: Dict) -> None:
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"Trainable parameters: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+
+    # Keep DEFAULT_CONFIG in sync so helper functions read the effective runtime knobs.
+    DEFAULT_CONFIG.update(config)
 
     # ── 5. Load data ──
     print("\nLoading training data...")
@@ -417,6 +592,12 @@ def main():
     parser.add_argument("--lora_r", type=int, default=None)
     parser.add_argument("--max_length", type=int, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--no_news_aug", action="store_true",
+                        help="Disable synthetic news reasoning augmentation")
+    parser.add_argument("--news_examples", type=int, default=None,
+                        help="Max synthetic news reasoning examples to generate")
+    parser.add_argument("--no_h100_preset", action="store_true",
+                        help="Disable automatic H100/high-memory GPU tuning")
 
     args = parser.parse_args()
 
@@ -435,6 +616,12 @@ def main():
         config["model_max_length"] = args.max_length
     if args.output_dir:
         config["output_dir"] = args.output_dir
+    if args.no_news_aug:
+        config["augment_news_reasoning"] = False
+    if args.news_examples is not None:
+        config["news_reasoning_max_examples"] = max(0, int(args.news_examples))
+    if args.no_h100_preset:
+        config["auto_h100_preset"] = False
 
     if not check_dependencies():
         sys.exit(1)

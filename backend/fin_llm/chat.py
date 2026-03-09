@@ -52,7 +52,9 @@ Rules:
 3. Cite specific indicators, tickers, and price levels
 4. Discuss both bull and bear scenarios
 5. Include risk management considerations
-6. Reference historical parallels when relevant"""
+6. Reference historical parallels when relevant
+7. For major news, reason via transmission channels: policy/rates -> USD/yields -> credit/liquidity -> earnings -> positioning
+8. Provide scenario probabilities (base/bull/bear) and clear invalidation signals"""
 
 
 # ══════════════════════════════════════════════════════════════

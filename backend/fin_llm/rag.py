@@ -254,6 +254,82 @@ class FinancialRAG:
             return f"news:{item.get('title', '')[:120]}:{item.get('date', '')}"
         return f"{ctype}:{str(item)[:120]}"
 
+    def _infer_news_theme(self, text: str) -> str:
+        t = (text or "").lower()
+        theme_map = {
+            "monetary_policy": ["fed", "fomc", "rate", "hawkish", "dovish", "yield"],
+            "inflation": ["cpi", "pce", "inflation", "prices"],
+            "labor": ["jobs", "payroll", "unemployment", "claims"],
+            "growth": ["gdp", "recession", "slowdown", "pmi", "manufacturing"],
+            "geopolitics": ["tariff", "sanction", "war", "election", "trade"],
+            "energy": ["oil", "gas", "brent", "wti", "energy"],
+            "tech_ai": ["ai", "chip", "semiconductor", "cloud", "software"],
+        }
+        best = "general"
+        best_score = 0
+        for theme, kws in theme_map.items():
+            score = sum(1 for kw in kws if kw in t)
+            if score > best_score:
+                best_score = score
+                best = theme
+        return best
+
+    def _infer_risk_bias(self, text: str) -> str:
+        t = (text or "").lower()
+        risk_off = ["selloff", "slowdown", "recession", "default", "stress", "tariff", "war", "inflation" ]
+        risk_on = ["rally", "disinflation", "easing", "growth", "upgrade", "beat", "stimulus"]
+        roff = sum(1 for w in risk_off if w in t)
+        ron = sum(1 for w in risk_on if w in t)
+        if roff > ron:
+            return "risk_off"
+        if ron > roff:
+            return "risk_on"
+        return "balanced"
+
+    def _build_news_regime_summary(self, contexts: List[Dict[str, Any]], max_news: int = 8) -> str:
+        news_rows = [c for c in contexts if c.get("type") == "news"][:max_news]
+        if not news_rows:
+            return ""
+
+        theme_counts: Dict[str, int] = {}
+        bias_counts = {"risk_on": 0, "risk_off": 0, "balanced": 0}
+        latest_dates: List[datetime] = []
+        key_lines: List[str] = []
+
+        for c in news_rows:
+            d = c.get("data", {})
+            text = " ".join([
+                str(d.get("title", "")),
+                str(d.get("content", "")),
+            ])
+            theme = self._infer_news_theme(text)
+            bias = self._infer_risk_bias(text)
+            theme_counts[theme] = theme_counts.get(theme, 0) + 1
+            bias_counts[bias] = bias_counts.get(bias, 0) + 1
+            dt = self._extract_date(d)
+            if dt is not None:
+                latest_dates.append(dt)
+
+            title = str(d.get("title", "")).strip()
+            if title:
+                key_lines.append(f"- {title} [{theme}/{bias}]")
+
+        dominant_themes = sorted(theme_counts.items(), key=lambda x: x[1], reverse=True)
+        theme_str = ", ".join([f"{k}:{v}" for k, v in dominant_themes[:4]]) if dominant_themes else "n/a"
+        dominant_bias = max(bias_counts.items(), key=lambda x: x[1])[0]
+        latest = max(latest_dates).strftime("%Y-%m-%d") if latest_dates else "unknown"
+
+        summary = [
+            "[NEWS REGIME SNAPSHOT]",
+            f"- latest_timestamp: {latest}",
+            f"- dominant_themes: {theme_str}",
+            f"- risk_bias: {dominant_bias}",
+            "- key_headlines:",
+            *key_lines[:5],
+            "- inference_guidance: prioritize transmission channels and scenario probabilities over single-headline reactions.",
+        ]
+        return "\n".join(summary)
+
     def retrieve(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         """
         Retrieve relevant context for a query.
@@ -402,6 +478,12 @@ class FinancialRAG:
                 break
             parts.append(text)
             current_length += token_est
+
+        regime = self._build_news_regime_summary(contexts)
+        if regime:
+            token_est = len(regime) // 4
+            if current_length + token_est <= max_tokens:
+                parts.append(regime)
 
         return "\n\n".join(parts)
 
