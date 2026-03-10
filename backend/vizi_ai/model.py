@@ -427,7 +427,11 @@ class NewsEncoder(nn.Module):
 
         # Attention pool within each headline
         emb_flat = emb.view(B * N, T, -1)
-        attn_w = torch.softmax(self.headline_attn(emb_flat), dim=1)  # (B*N, T, 1)
+        attn_logits = self.headline_attn(emb_flat)  # (B*N, T, 1)
+        # Clamp logits to prevent exp() overflow in softmax — training
+        # stability fix for sequences with many zero-padding tokens.
+        attn_logits = attn_logits.clamp(-20.0, 20.0)
+        attn_w = torch.softmax(attn_logits, dim=1)
         pooled = (emb_flat * attn_w).sum(dim=1)  # (B*N, embed_dim)
         pooled = pooled.view(B, N, -1)  # (B, N, embed_dim)
 
@@ -607,11 +611,22 @@ class ViziMarketTransformer(nn.Module):
             nn.init.zeros_(module.bias)
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        # ── Input sanitization ──
+        # Clamp all floating-point inputs to prevent NaN propagation.
+        # Even with data-pipeline sanitization, edge cases (e.g. a corrupt
+        # CSV row that slipped through) can produce extreme values that
+        # cause NaN in the very first Linear projection.
+        _CLAMP = 10.0
+        price_seq = batch["price_seq"].clamp(-_CLAMP, _CLAMP)
+        macro_seq = batch["macro_seq"].clamp(-_CLAMP, _CLAMP)
+        market_seq = batch["market_seq"].clamp(-_CLAMP, _CLAMP)
+        fundamental = batch["fundamental"].clamp(-_CLAMP, _CLAMP)
+
         # Encode each modality
-        price_tokens = self.price_enc(batch["price_seq"])
-        macro_tokens = self.macro_enc(batch["macro_seq"])
-        market_tokens = self.market_enc(batch["market_seq"])
-        fund_token = self.fund_enc(batch["fundamental"])
+        price_tokens = self.price_enc(price_seq)
+        macro_tokens = self.macro_enc(macro_seq)
+        market_tokens = self.market_enc(market_seq)
+        fund_token = self.fund_enc(fundamental)
         news_tokens = self.news_enc(batch["news_ids"])
         stock_token = self.stock_embed(batch["stock_id"]).unsqueeze(1)
 

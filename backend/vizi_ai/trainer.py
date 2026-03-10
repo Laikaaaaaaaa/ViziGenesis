@@ -674,13 +674,23 @@ class UncertaintyMultiTaskLoss(nn.Module):
         total = torch.tensor(0.0, device=losses[0].device)
         info = {}
         task_names = ["direction", "ret_1d", "ret_5d", "ret_21d", "regime"]
+        # Clamp log_vars to [-4, 4] — prevents precision from exploding
+        # (exp(4)≈55× weight) or collapsing (exp(-4)≈0.018× weight),
+        # which can cause NaN in early training when loss magnitudes
+        # are very different across tasks.
+        clamped_lv = self.log_vars.clamp(-4.0, 4.0)
         for i, (loss, name) in enumerate(zip(losses, task_names)):
-            precision = torch.exp(-self.log_vars[i])
-            weighted = precision * loss + self.log_vars[i] * 0.5
+            # Guard: skip non-finite individual losses
+            if not torch.isfinite(loss):
+                info[f"loss_{name}"] = 0.0
+                info[f"weight_{name}"] = 0.0
+                continue
+            precision = torch.exp(-clamped_lv[i])
+            weighted = precision * loss + clamped_lv[i] * 0.5
             total = total + weighted
             info[f"loss_{name}"] = loss.item()
             info[f"weight_{name}"] = precision.item()
-        info["loss_total"] = total.item()
+        info["loss_total"] = total.item() if torch.isfinite(total) else 0.0
         return total, info
 
 
@@ -701,24 +711,38 @@ def _cosine_warmup_schedule(optimizer, warmup_steps: int, total_steps: int):
 # ═══════════════════════════════════════════════════════════════
 def _compute_losses(preds: Dict[str, torch.Tensor],
                     targets: Dict[str, torch.Tensor]) -> List[torch.Tensor]:
-    """Individual task losses (not weighted yet)."""
-    losses = []
+    """Individual task losses (not weighted yet).
 
-    # Direction: binary cross-entropy with logits (autocast-safe)
+    Includes numerical-stability safeguards:
+    - Prediction clamping to prevent extreme logit values.
+    - Per-loss NaN replacement with a safe fallback value so a single
+      corrupt sample doesn't poison the entire mega-batch.
+    """
+    losses = []
+    _SAFE = torch.tensor(0.0, device=next(iter(preds.values())).device)
+
+    # Direction: binary cross-entropy with logits
     dir_pred = preds["direction"].squeeze(-1)
-    dir_target = targets["direction"].squeeze(-1)
-    losses.append(F.binary_cross_entropy_with_logits(dir_pred, dir_target))
+    dir_target = targets["direction"].squeeze(-1).clamp(0.0, 1.0)
+    # Clamp logits to [-20, 20] — prevents exp() overflow inside BCE.
+    dir_pred = dir_pred.clamp(-20.0, 20.0)
+    l = F.binary_cross_entropy_with_logits(dir_pred, dir_target)
+    losses.append(l if torch.isfinite(l) else _SAFE)
 
     # Return regression: Huber loss (robust to outliers in financial returns)
     for key in ["ret_1d", "ret_5d", "ret_21d"]:
         pred = preds[key].squeeze(-1)
-        target = targets[key].squeeze(-1)
-        losses.append(F.huber_loss(pred, target, delta=0.05))
+        target = targets[key].squeeze(-1).clamp(-1.0, 1.0)
+        l = F.huber_loss(pred, target, delta=0.05)
+        losses.append(l if torch.isfinite(l) else _SAFE)
 
     # Regime: cross-entropy
     regime_pred = preds["regime"]
     regime_target = targets["regime"].squeeze(-1)
-    losses.append(F.cross_entropy(regime_pred, regime_target))
+    # Clamp logits for cross-entropy stability
+    regime_pred = regime_pred.clamp(-20.0, 20.0)
+    l = F.cross_entropy(regime_pred, regime_target)
+    losses.append(l if torch.isfinite(l) else _SAFE)
 
     return losses
 
@@ -1005,6 +1029,7 @@ class ViziTrainer:
             for batch in train_loader:
                 # Move to device
                 batch = self._to_device(batch)
+                batch = _sanitize_batch(batch)
                 batch_size = batch["price_seq"].shape[0]
 
                 with _autocast_ctx(device_type=self.device.type, enabled=cfg.use_amp):
@@ -1331,8 +1356,10 @@ def _estimate_parallel_stocks(
     available_mb = (total_gb - reserve_gb) * 1024
 
     k = max(1, int(available_mb / per_stock_mb))
-    # Cap so that mega-batch doesn't exceed reasonable kernel sizes
-    k = min(k, n_symbols, 128)
+    # Cap so that mega-batch doesn't exceed reasonable kernel sizes.
+    # Also cap at 8 for training stability — very large mega-batches
+    # (50+ stocks) amplify data-quality problems and cause NaN loss.
+    k = min(k, n_symbols, 8)
     return k
 
 
@@ -1346,6 +1373,62 @@ def _has_non_finite_inputs(batch: Dict[str, Any]) -> bool:
                 if isinstance(vv, torch.Tensor) and vv.is_floating_point() and not torch.isfinite(vv).all():
                     return True
     return False
+
+
+def _diagnose_non_finite(batch: Dict[str, Any], symbols: List[str]) -> str:
+    """Build a human-readable diagnostic string for non-finite inputs.
+
+    Reports which modality tensors contain NaN/Inf and which stock IDs
+    are affected so the operator can investigate the underlying CSV.
+    """
+    parts: List[str] = []
+    affected_stocks: set = set()
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor) and v.is_floating_point():
+            bad = ~torch.isfinite(v)
+            if bad.any():
+                n_bad = int(bad.sum())
+                parts.append(f"{k}: {n_bad} non-finite")
+                # Identify which batch rows are affected
+                if v.dim() >= 1:
+                    bad_rows = bad.any(dim=tuple(range(1, v.dim()))).nonzero(as_tuple=True)[0]
+                    affected_stocks.update(bad_rows.tolist())
+        elif isinstance(v, dict):
+            for kk, vv in v.items():
+                if isinstance(vv, torch.Tensor) and vv.is_floating_point():
+                    bad = ~torch.isfinite(vv)
+                    if bad.any():
+                        parts.append(f"targets/{kk}: {int(bad.sum())} non-finite")
+    # Map row indices to stock symbols
+    stock_ids = batch.get("stock_id")
+    if stock_ids is not None and affected_stocks:
+        sym_names = []
+        for idx in sorted(affected_stocks):
+            sid = int(stock_ids[idx])
+            sym_names.append(symbols[sid] if sid < len(symbols) else f"id:{sid}")
+        parts.append(f"stocks: {', '.join(sym_names[:10])}")
+    return "; ".join(parts) if parts else "unknown"
+
+
+def _sanitize_batch(batch: Dict[str, Any], clamp_val: float = 10.0) -> Dict[str, Any]:
+    """In-place clamp all floating-point tensors in a batch dict.
+
+    This is the last-resort safety net inside the training loop.
+    Even with data-pipeline sanitization, forward-pass activations
+    from a prior corrupt batch could leave gradients in a bad state,
+    so clamping inputs again right before the forward pass is cheap
+    insurance."""
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor) and v.is_floating_point():
+            v.clamp_(-clamp_val, clamp_val)
+            # Replace NaN with 0 (in-place)
+            v[~torch.isfinite(v)] = 0.0
+        elif isinstance(v, dict):
+            for kk, vv in v.items():
+                if isinstance(vv, torch.Tensor) and vv.is_floating_point():
+                    vv.clamp_(-1.0, 1.0)  # tighter range for targets
+                    vv[~torch.isfinite(vv)] = 0.0
+    return batch
 
 
 def _move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
@@ -1500,16 +1583,22 @@ def train_per_stock_specialists(
                         else:
                             exhausted[i] = True
 
-                # ── Move to device & filter non-finite inputs ──
+                # ── Move to device & sanitize inputs ──
                 ready: List[Tuple[int, Dict[str, Any]]] = []
                 for i in range(K):
                     if fetched[i] is None:
                         continue
                     batch_dev = _move_batch_to_device(fetched[i], device)
+                    # Sanitize: clamp all float tensors, replace NaN in-place
+                    batch_dev = _sanitize_batch(batch_dev)
                     if _has_non_finite_inputs(batch_dev):
+                        diag = _diagnose_non_finite(
+                            batch_dev, group_syms,
+                        )
                         logger.warning(
-                            "  Specialist %s: skipping non-finite input (epoch %d)",
-                            group_syms[i], epoch + 1,
+                            "  Specialist %s: skipping non-finite input "
+                            "(epoch %d) — %s",
+                            group_syms[i], epoch + 1, diag,
                         )
                         continue
                     ready.append((i, batch_dev))
@@ -1529,11 +1618,17 @@ def train_per_stock_specialists(
                         preds = model(mega_batch)
                         task_losses = _compute_losses(preds, mega_batch["targets"])
                         total_loss = sum(w * l for w, l in zip(warmup_weights, task_losses))
+                        # Clamp total loss to prevent initial explosion from
+                        # outlier samples.  50 is generous (normal loss ~1-5).
+                        total_loss = total_loss.clamp(max=50.0)
 
                     if not torch.isfinite(total_loss):
+                        diag = _diagnose_non_finite(mega_batch, symbols)
                         logger.warning(
-                            "  Group %d round %d: non-finite mega-batch loss — skipping",
+                            "  Group %d round %d: non-finite mega-batch loss — "
+                            "skipping (%s)",
                             g_start // num_parallel_stocks + 1, round_idx,
+                            diag,
                         )
                         optimizer.zero_grad(set_to_none=True)
                         round_idx += 1

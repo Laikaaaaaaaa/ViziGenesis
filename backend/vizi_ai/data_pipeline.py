@@ -48,6 +48,64 @@ ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / "data"
 PROCESSED = DATA / "processed"
 
+# Hard ceiling for any normalised feature value.  Values beyond this
+# indicate data errors or extreme outliers that would destabilise
+# gradients during training (especially with AMP / bf16).
+_MAX_FEATURE_VAL = 10.0
+
+# ═══════════════════════════════════════════════════════════════
+#  Currency & timezone metadata for multi-country handling
+# ═══════════════════════════════════════════════════════════════
+# Maps symbol suffix → (currency, UTC offset of market close, country)
+MARKET_META = {
+    ".VN":  ("VND", 7,  "VN"),   # Vietnam HOSE/HNX  close ~14:30 UTC+7
+    ".HM":  ("VND", 7,  "VN"),
+    ".T":   ("JPY", 9,  "JP"),   # Tokyo Stock Exchange close ~15:00 UTC+9
+    ".KS":  ("KRW", 9,  "KR"),   # Korea Exchange      close ~15:30 UTC+9
+    ".KQ":  ("KRW", 9,  "KR"),   # KOSDAQ
+    ".HK":  ("HKD", 8,  "HK"),   # HKEX               close ~16:00 UTC+8
+    ".SS":  ("CNY", 8,  "CN"),   # Shanghai
+    ".SZ":  ("CNY", 8,  "CN"),   # Shenzhen
+    ".L":   ("GBP", 0,  "GB"),   # London
+    ".PA":  ("EUR", 1,  "FR"),   # Paris
+    ".DE":  ("EUR", 1,  "DE"),   # Frankfurt
+    ".TO":  ("CAD", -5, "CA"),   # Toronto
+}
+# US stocks (no suffix) default:
+_US_META = ("USD", -5, "US")
+# US market close UTC offset (Eastern Time, ~16:00 → UTC-5 / UTC-4 DST)
+_US_CLOSE_UTC = -5
+
+
+def _symbol_meta(symbol: str) -> tuple:
+    """Return (currency, utc_close_offset, country) for a symbol."""
+    for suffix, meta in MARKET_META.items():
+        if symbol.upper().endswith(suffix.upper()):
+            return meta
+    return _US_META
+
+
+def _closes_before_us(symbol: str) -> bool:
+    """True if this symbol's exchange closes *before* the US market.
+
+    For such symbols we must use T-1 US/macro data to avoid look-ahead."""
+    _, utc_off, _ = _symbol_meta(symbol)
+    # Asian / European markets close before US (UTC+7..+9 vs UTC-5)
+    return utc_off > _US_CLOSE_UTC
+
+
+def _sanitize_array(arr: np.ndarray,
+                    max_val: float = _MAX_FEATURE_VAL) -> np.ndarray:
+    """Replace non-finite values and clip to [-max_val, +max_val].
+
+    This is the last line of defence before tensors enter the model.
+    Financial data is notoriously dirty — inf from pct_change on zero
+    prices, NaN from missing series, and extreme outliers from illiquid
+    markets.  Clamping to a fixed range prevents gradient explosion
+    in AMP / bf16 training."""
+    arr = np.nan_to_num(arr, nan=0.0, posinf=max_val, neginf=-max_val)
+    return np.clip(arr, -max_val, max_val).astype(np.float32)
+
 # ═══════════════════════════════════════════════════════════════
 #  Configuration
 # ═══════════════════════════════════════════════════════════════
@@ -230,28 +288,35 @@ def _robust_scale(arr: np.ndarray) -> np.ndarray:
     q25 = np.nanpercentile(arr, 25, axis=0, keepdims=True)
     iqr = q75 - q25
     iqr = np.where(iqr < 1e-8, 1.0, iqr)
-    return ((arr - med) / iqr).astype(np.float32)
+    scaled = ((arr - med) / iqr).astype(np.float32)
+    # Hard clip — prevents outlier columns from producing extreme values
+    # that would cause NaN in AMP forward passes.
+    return np.clip(scaled, -_MAX_FEATURE_VAL, _MAX_FEATURE_VAL)
 
 
 def _zscore(arr: np.ndarray) -> np.ndarray:
     mu = np.nanmean(arr, axis=0, keepdims=True)
     std = np.nanstd(arr, axis=0, keepdims=True)
     std = np.where(std < 1e-8, 1.0, std)
-    return ((arr - mu) / std).astype(np.float32)
+    scaled = ((arr - mu) / std).astype(np.float32)
+    return np.clip(scaled, -_MAX_FEATURE_VAL, _MAX_FEATURE_VAL)
 
 
 def normalise(arr: np.ndarray, method: str = "robust") -> np.ndarray:
     if method == "robust":
-        return _robust_scale(arr)
+        out = _robust_scale(arr)
     elif method == "zscore":
-        return _zscore(arr)
+        out = _zscore(arr)
     elif method == "minmax":
         lo = np.nanmin(arr, axis=0, keepdims=True)
         hi = np.nanmax(arr, axis=0, keepdims=True)
         rng = hi - lo
         rng = np.where(rng < 1e-8, 1.0, rng)
-        return ((arr - lo) / rng).astype(np.float32)
-    return arr.astype(np.float32)
+        out = ((arr - lo) / rng).astype(np.float32)
+    else:
+        out = arr.astype(np.float32)
+    # Final sanitization — no NaN/Inf must leave this function.
+    return _sanitize_array(out)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -267,22 +332,81 @@ FUNDAMENTAL_KEYS = [
 N_FUNDAMENTAL_FEATURES = len(FUNDAMENTAL_KEYS)
 
 
+# Reasonable range limits for fundamental ratios.  Values outside
+# these are almost certainly data errors or extreme outliers that
+# would blow up gradients if fed raw into the model.
+_FUND_CLIP = {
+    "trailingPE":       (-200, 2000),
+    "forwardPE":        (-200, 2000),
+    "priceToBook":      (-50, 500),
+    "priceToSalesTrailing12Months": (0, 500),
+    "enterpriseToEbitda": (-100, 500),
+    "profitMargins":    (-5, 5),
+    "operatingMargins": (-5, 5),
+    "grossMargins":     (-5, 5),
+    "returnOnEquity":   (-10, 10),
+    "returnOnAssets":   (-5, 5),
+    "debtToEquity":     (-100, 5000),
+    "currentRatio":     (0, 100),
+    "quickRatio":       (0, 100),
+    "revenueGrowth":    (-5, 50),
+    "earningsGrowth":   (-5, 50),
+    "freeCashflow":     None,  # handled with sign-aware log
+    "dividendYield":    (0, 1),
+    "beta":             (-5, 10),
+    "marketCap":        None,  # handled with log
+    "enterpriseValue":  None,  # handled with log
+}
+
+
 def _fundamentals_to_vector(fund: Dict[str, Any]) -> np.ndarray:
-    """Convert fundamental dict → fixed-length float vector."""
+    """Convert fundamental dict → fixed-length float vector.
+
+    Key fixes for multi-country data:
+    - Sign-aware log scaling for monetary values (freeCashflow, marketCap,
+      enterpriseValue) — eliminates currency-scale differences.
+      e.g. VND market caps (trillions) vs USD (billions) both map to ~20-35.
+    - Clip ratios to physically reasonable ranges before they enter the model.
+    - Robust-scale the final vector so all fundamentals are O(1).
+    """
     ks = fund.get("key_stats", {})
-    vec = np.full(N_FUNDAMENTAL_FEATURES, np.nan, dtype=np.float32)
+    vec = np.full(N_FUNDAMENTAL_FEATURES, 0.0, dtype=np.float32)
     for i, key in enumerate(FUNDAMENTAL_KEYS):
         val = ks.get(key)
-        if val is not None:
-            try:
-                vec[i] = float(val)
-            except (ValueError, TypeError):
-                pass
-    # Log-scale large values
+        if val is None:
+            continue
+        try:
+            v = float(val)
+        except (ValueError, TypeError):
+            continue
+        if not np.isfinite(v):
+            continue
+        vec[i] = v
+
+    # Sign-aware log scaling for monetary values (handles negative FCF
+    # and cross-currency scale: VND trillions vs USD billions).
     for idx in [15, 18, 19]:  # freeCashflow, marketCap, enterpriseValue
-        if not np.isnan(vec[idx]) and vec[idx] > 0:
-            vec[idx] = np.log1p(vec[idx])
-    return vec
+        v = vec[idx]
+        if v != 0.0:
+            vec[idx] = np.sign(v) * np.log1p(abs(v))
+
+    # Clip ratio features to sane ranges
+    for i, key in enumerate(FUNDAMENTAL_KEYS):
+        bounds = _FUND_CLIP.get(key)
+        if bounds is not None:
+            lo, hi = bounds
+            vec[i] = np.clip(vec[i], lo, hi)
+
+    # Robust-scale the vector so all values are O(1) — essential for
+    # the FundamentalEncoder Linear layer to not blow up.
+    med = np.nanmedian(vec)
+    q75, q25 = np.nanpercentile(vec, 75), np.nanpercentile(vec, 25)
+    iqr = q75 - q25
+    if iqr < 1e-8:
+        iqr = max(abs(med), 1.0)
+    vec = (vec - med) / iqr
+
+    return _sanitize_array(vec)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -314,29 +438,45 @@ def _macro_snapshot(date: pd.Timestamp, macro: Dict[str, pd.DataFrame],
     arr = np.column_stack(cols) if cols else np.zeros((seq_len, 1), dtype=np.float32)
     # Forward-fill, then back-fill NaN
     df_tmp = pd.DataFrame(arr).ffill().bfill().fillna(0)
-    return df_tmp.values.astype(np.float32)
+    return _sanitize_array(df_tmp.values)
 
 
 # ═══════════════════════════════════════════════════════════════
 #  Cross-market features (time-aligned)
 # ═══════════════════════════════════════════════════════════════
 def _market_snapshot(date: pd.Timestamp, markets: Dict[str, pd.DataFrame],
-                     seq_len: int) -> np.ndarray:
-    """(seq_len, N_markets) of cross-market daily returns."""
+                     seq_len: int,
+                     lag_one_day: bool = False) -> np.ndarray:
+    """(seq_len, N_markets) of cross-market daily returns.
+
+    Args:
+        lag_one_day: If True, shift the snapshot back by 1 business day.
+            Used for Asian stocks to avoid look-ahead bias (US market
+            data from the same calendar date was not available when
+            the Asian market closed).
+    """
+    end_date = date
+    if lag_one_day:
+        # Use T-1 data to prevent look-ahead from later-closing markets
+        end_date = date - pd.tseries.offsets.BDay(1)
+
     cols = []
     for name, df in markets.items():
         col = df.columns[0]
         series = df[col].sort_index()
-        idx = pd.bdate_range(end=date, periods=seq_len * 3, freq="B")
+        idx = pd.bdate_range(end=end_date, periods=seq_len * 3, freq="B")
         series = series.reindex(idx, method="ffill").bfill()
-        # Convert to returns
-        rets = series.pct_change(fill_method=None).fillna(0).iloc[-seq_len:].values.astype(np.float32)
+        # Convert to returns — clip to ±50% to squash inf from zero-price gaps
+        rets = series.pct_change(fill_method=None).fillna(0)
+        rets = rets.clip(-0.5, 0.5)  # no single-day index move > 50%
+        rets = rets.iloc[-seq_len:].values.astype(np.float32)
         if len(rets) < seq_len:
             rets = np.pad(rets, (seq_len - len(rets), 0), constant_values=0)
         cols.append(rets[:seq_len])
     if not cols:
         return np.zeros((seq_len, 1), dtype=np.float32)
-    return np.column_stack(cols)
+    arr = np.column_stack(cols)
+    return _sanitize_array(arr, max_val=1.0)  # returns are O(0.01)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -495,14 +635,20 @@ class StockDataStream(IterableDataset):
         price_df = price_df.ffill().bfill().fillna(0)
         price_arr = price_df.values.astype(np.float32)
 
+        # Replace any remaining inf/nan *before* normalisation to prevent
+        # poisoning of median/IQR statistics in robust scaler.
+        price_arr = np.nan_to_num(price_arr, nan=0.0, posinf=0.0, neginf=0.0)
+
         # Normalise price features per-stock (training window stats)
         price_arr = normalise(price_arr, cfg.price_scaler)
-        price_arr = np.nan_to_num(price_arr, nan=0.0, posinf=3.0, neginf=-3.0)
+        # normalise() already calls _sanitize_array, but be explicit:
+        price_arr = _sanitize_array(price_arr)
 
         # ── Fundamental vector ──
-        fund_vec = _fundamentals_to_vector(fund)
-        # Normalise (cross-section would be better, but per-stock is simpler)
-        fund_vec = np.nan_to_num(fund_vec, nan=0.0)
+        fund_vec = _fundamentals_to_vector(fund)  # already sanitized inside
+
+        # ── Timezone awareness: use T-1 macro/market for non-US stocks ──
+        use_lag = _closes_before_us(self.symbol)
 
         # ── Date-based split ──
         dates = ohlcv.index
@@ -538,13 +684,21 @@ class StockDataStream(IterableDataset):
                 seq = np.vstack([pad, seq])
 
             # ── Macro sequence ──
-            macro_seq = _macro_snapshot(anchor_date, macro, cfg.macro_seq_len)
+            # For non-US stocks, shift macro window back 1 day to avoid
+            # using same-day US macro releases as features (look-ahead).
+            macro_date = anchor_date
+            if use_lag:
+                macro_date = anchor_date - pd.tseries.offsets.BDay(1)
+            macro_seq = _macro_snapshot(macro_date, macro, cfg.macro_seq_len)
             macro_seq = normalise(macro_seq, cfg.macro_scaler)
-            macro_seq = np.nan_to_num(macro_seq, nan=0.0, posinf=3.0, neginf=-3.0)
+            macro_seq = _sanitize_array(macro_seq)
 
             # ── Market cross-asset ──
-            market_seq = _market_snapshot(anchor_date, markets, cfg.macro_seq_len)
-            market_seq = np.nan_to_num(market_seq, nan=0.0, posinf=3.0, neginf=-3.0)
+            market_seq = _market_snapshot(
+                anchor_date, markets, cfg.macro_seq_len,
+                lag_one_day=use_lag,
+            )
+            market_seq = _sanitize_array(market_seq, max_val=1.0)
 
             # ── News ──
             news_enc = _news_for_date(anchor_date, news, cfg.max_news_items, cfg.max_news_tokens)
@@ -555,6 +709,19 @@ class StockDataStream(IterableDataset):
                 cfg.regime_window, cfg.regime_thresholds,
             )
             if targets is None:
+                continue
+
+            # Clip return targets to ±50% — extreme outliers from stock
+            # splits, delistings, or data errors destabilise Huber loss.
+            for tk, tv in targets.items():
+                if tk.startswith("ret_"):
+                    targets[tk] = np.clip(tv, -0.5, 0.5)
+
+            # ── Final per-sample validation ──
+            # Skip any sample with non-finite values rather than let it
+            # poison the mega-batch and cause NaN loss.
+            sample_arrays = [seq, macro_seq, market_seq, fund_vec]
+            if any(not np.all(np.isfinite(a)) for a in sample_arrays):
                 continue
 
             yield {

@@ -97,10 +97,12 @@ tkr-tz.db
 
 # Large datasets and training artifacts (never commit)
 data/**
+models/**
 
 # Keep lightweight data scripts in repo
 !data/*.py
 !data/**/*.py
+!models/.gitkeep
 
 # Docker
 .dockerignore
